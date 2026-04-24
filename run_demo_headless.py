@@ -47,6 +47,12 @@ if __name__=='__main__':
     logging.info(f'i:{i}')
     color = reader.get_color(i)
     depth = reader.get_depth(i)
+    """
+    K:      (3, 3)    float64
+    color:  (H, W, 3) uint8
+    depth:  (H, W)    float64
+    mask:   (H, W)    bool
+    """
     if i==0:
       mask = reader.get_mask(0).astype(bool)
       pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=mask, iteration=args.est_refine_iter)
