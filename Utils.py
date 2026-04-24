@@ -99,28 +99,74 @@ def set_logging_format(level=logging.INFO):
 set_logging_format()
 
 
+def _get_material_texture_image(material):
+  if material is None:
+    return None
+  image = getattr(material, 'image', None)
+  if image is not None:
+    return image
+  image = getattr(material, 'baseColorTexture', None)
+  if image is not None:
+    return image
+  to_simple = getattr(material, 'to_simple', None)
+  if callable(to_simple):
+    simple = to_simple()
+    return getattr(simple, 'image', None)
+  return None
+
+
+def _get_material_main_color(material):
+  if material is None:
+    return None
+  color = getattr(material, 'main_color', None)
+  if color is None:
+    color = getattr(material, 'baseColorFactor', None)
+  if color is None:
+    return None
+  color = np.asarray(color, dtype=np.float32).reshape(-1)
+  if len(color) < 3:
+    return None
+  color = color[:3]
+  if color.max(initial=0) <= 1.0:
+    color = color * 255.0
+  return np.clip(color, 0, 255).astype(np.uint8)
+
+
+def _make_vertex_color_tensor(mesh, device='cuda', color=None):
+  if color is None and mesh.visual.vertex_colors is not None:
+    color = mesh.visual.vertex_colors[...,:3]
+  if color is None:
+    logging.info(f"WARN: mesh doesn't have usable texture or vertex_colors, assigning a pure color")
+    color = np.tile(np.array([128,128,128], dtype=np.uint8).reshape(1,3), (len(mesh.vertices), 1))
+  elif color.ndim == 1:
+    color = np.tile(color.reshape(1,3), (len(mesh.vertices), 1))
+  return torch.as_tensor(color[...,:3], device=device, dtype=torch.float)/255.0
+
+
 
 
 def make_mesh_tensors(mesh, device='cuda', max_tex_size=None):
   mesh_tensors = {}
   if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-    img = np.array(mesh.visual.material.image.convert('RGB'))
-    img = img[...,:3]
-    if max_tex_size is not None:
-      max_size = max(img.shape[0], img.shape[1])
-      if max_size>max_tex_size:
-        scale = 1/max_size * max_tex_size
-        img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
-    mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
-    mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
-    uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
-    uv[:,1] = 1 - uv[:,1]
-    mesh_tensors['uv']  = uv
+    image = _get_material_texture_image(getattr(mesh.visual, 'material', None))
+    if image is not None and getattr(mesh.visual, 'uv', None) is not None:
+      img = np.array(image.convert('RGB'))
+      img = img[...,:3]
+      if max_tex_size is not None:
+        max_size = max(img.shape[0], img.shape[1])
+        if max_size>max_tex_size:
+          scale = 1/max_size * max_tex_size
+          img = cv2.resize(img, fx=scale, fy=scale, dsize=None)
+      mesh_tensors['tex'] = torch.as_tensor(img, device=device, dtype=torch.float)[None]/255.0
+      mesh_tensors['uv_idx']  = torch.as_tensor(mesh.faces, device=device, dtype=torch.int)
+      uv = torch.as_tensor(mesh.visual.uv, device=device, dtype=torch.float)
+      uv[:,1] = 1 - uv[:,1]
+      mesh_tensors['uv']  = uv
+    else:
+      color = _get_material_main_color(getattr(mesh.visual, 'material', None))
+      mesh_tensors['vertex_color'] = _make_vertex_color_tensor(mesh, device=device, color=color)
   else:
-    if mesh.visual.vertex_colors is None:
-      logging.info(f"WARN: mesh doesn't have vertex_colors, assigning a pure color")
-      mesh.visual.vertex_colors = np.tile(np.array([128,128,128]).reshape(1,3), (len(mesh.vertices), 1))
-    mesh_tensors['vertex_color'] = torch.as_tensor(mesh.visual.vertex_colors[...,:3], device=device, dtype=torch.float)/255.0
+    mesh_tensors['vertex_color'] = _make_vertex_color_tensor(mesh, device=device)
 
   mesh_tensors.update({
     'pos': torch.tensor(mesh.vertices, device=device, dtype=torch.float),
