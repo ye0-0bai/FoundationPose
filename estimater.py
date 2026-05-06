@@ -270,7 +270,7 @@ class FoundationPose:
       logging.info(f'valid too small, return')
       pose = np.eye(4)
       pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
-      return pose
+      return pose[np.newaxis], np.array([np.nan])
 
     if self.debug>=2:
       imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
