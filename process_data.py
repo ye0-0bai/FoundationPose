@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import imageio.v3 as iio
@@ -238,83 +239,102 @@ def smooth_pose_trajectory(trajectory, max_invalid_gap=5, smooth_window=7, smoot
 
 
 def main():
-    
-    intrinsics = np.load("/data/datasets/DexYCB/processed/20200709-subject-01/20200709_141754/841412060263/video/intrinsics.npy")
-    intrinsics = intrinsics.astype(np.float64)
-    
-    images = iio.imread("/data/datasets/DexYCB/processed/20200709-subject-01/20200709_141754/841412060263/video/images.mp4")
-    
-    depths = np.load("/data/datasets/DexYCB/processed/20200709-subject-01/20200709_141754/841412060263/video/depths.npy")
-    depths[depths==65535] = 0
-    depths = (depths.astype(np.float64)) / 1000.0
-    depths[(depths<0.001) | (depths>=np.inf)] = 0
-    
-    masks = np.load("/data/datasets/DexYCB/processed/20200709-subject-01/20200709_141754/841412060263/objects/predicted/object_0/masks.npz")
-    masks = masks["masks_visible"]
-    
-    mesh = trimesh.load("/data/datasets/DexYCB/processed/20200709-subject-01/20200709_141754/841412060263/objects/predicted/object_0/mesh.glb", force="mesh")
-    to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-    bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
-    
-    code_dir = os.path.dirname(os.path.realpath(__file__))
-    debug_dir = f"{code_dir}/debug"
-    
-    scorer = ScorePredictor()
-    refiner = PoseRefinePredictor()
-    glctx = dr.RasterizeCudaContext()
-    est = FoundationPose(
-        model_pts=mesh.vertices,
-        model_normals=mesh.vertex_normals,
-        mesh=mesh, scorer=scorer,
-        refiner=refiner,
-        debug_dir=debug_dir,
-        debug=0,
-        glctx=glctx,
-    )
-    
-    os.makedirs(debug_dir, exist_ok=True)
-    
-    T = images.shape[0]
-    all_poses = []
-    all_scores = []
-    for frame_idx in range(T):
-        poses, scores = est.register_all(
-            K=intrinsics,
-            rgb=images[frame_idx],
-            depth=depths[frame_idx],
-            ob_mask=masks[frame_idx],
-            iteration=5,
-        )
-        all_poses.append(poses)
-        all_scores.append(scores)
 
-    trajectory = select_pose_trajectory(
-        all_poses,
-        all_scores,
-        mesh_diameter=est.diameter,
-        trans_lambda=1.0,
-        rot_lambda=1.0,
-    )
-    trajectory = smooth_pose_trajectory(
-        trajectory,
-        max_invalid_gap=5,
-        smooth_window=7,
-        smooth_polyorder=2,
-    )
+    data_root = Path("/data/datasets/DexYCB/processed")
+    seq_dirs = sorted(data_root.glob("**/video"))
+    seq_dirs = [seq_dir.parent for seq_dir in seq_dirs]
 
-    video = []
-    for frame_idx, pose in enumerate(trajectory):
-        if not pose.any():
-            video.append(images[frame_idx])
-            continue
-        center_pose = pose@np.linalg.inv(to_origin)
-        vis = draw_posed_3d_box(intrinsics, img=images[frame_idx], ob_in_cam=center_pose, bbox=bbox)
-        vis = draw_xyz_axis(images[frame_idx], ob_in_cam=center_pose, scale=0.1, K=intrinsics, thickness=3, transparency=0, is_input_rgb=True)
+    for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
+        intrinsics_path = seq_dir / "video" / "intrinsics.npy"
+        images_path = seq_dir / "video" / "images.mp4"
+        depths_path = seq_dir / "video" / "depths.npy"
 
-        video.append(vis)
-        
-    video = np.stack(video, axis=0)
-    iio.imwrite(os.path.join(debug_dir, "vis.mp4"), video)
+        objects_root = seq_dir / "objects" / "predicted"
+        object_dirs = sorted(objects_root.glob("object_*"))
+        for object_dir in object_dirs:
+            masks_path = object_dir / "masks.npz"
+            mesh_path = object_dir / "mesh.glb"
+
+            intrinsics = np.load(intrinsics_path)
+            intrinsics = intrinsics.astype(np.float64)
+
+            images = iio.imread(images_path)
+
+            depths = np.load(depths_path)
+            depths[depths==65535] = 0
+            depths = (depths.astype(np.float64)) / 1000.0
+            depths[(depths<0.001) | (depths>=np.inf)] = 0
+
+            masks = np.load(masks_path)
+            masks = masks["masks_visible"]
+
+            mesh = trimesh.load(mesh_path, force="mesh")
+            to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+            bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
+
+            code_dir = os.path.dirname(os.path.realpath(__file__))
+            debug_dir = f"{code_dir}/debug"
+
+            scorer = ScorePredictor()
+            refiner = PoseRefinePredictor()
+            glctx = dr.RasterizeCudaContext()
+            est = FoundationPose(
+                model_pts=mesh.vertices,
+                model_normals=mesh.vertex_normals,
+                mesh=mesh, scorer=scorer,
+                refiner=refiner,
+                debug_dir=debug_dir,
+                debug=0,
+                glctx=glctx,
+            )
+
+            os.makedirs(debug_dir, exist_ok=True)
+
+            T = images.shape[0]
+            all_poses = []
+            all_scores = []
+            for frame_idx in range(T):
+                poses, scores = est.register_all(
+                    K=intrinsics,
+                    rgb=images[frame_idx],
+                    depth=depths[frame_idx],
+                    ob_mask=masks[frame_idx],
+                    iteration=5,
+                )
+                all_poses.append(poses)
+                all_scores.append(scores)
+
+            trajectory = select_pose_trajectory(
+                all_poses,
+                all_scores,
+                mesh_diameter=est.diameter,
+                trans_lambda=1.0,
+                rot_lambda=1.0,
+            )
+            trajectory = smooth_pose_trajectory(
+                trajectory,
+                max_invalid_gap=5,
+                smooth_window=7,
+                smooth_polyorder=2,
+            )
+
+            save_path = object_dir / "poses_optimized.npy"
+            np.save(save_path, trajectory)
+
+            video = []
+            for frame_idx, pose in enumerate(trajectory):
+                if not pose.any():
+                    video.append(images[frame_idx])
+                    continue
+                center_pose = pose@np.linalg.inv(to_origin)
+                vis = draw_posed_3d_box(intrinsics, img=images[frame_idx], ob_in_cam=center_pose, bbox=bbox)
+                vis = draw_xyz_axis(images[frame_idx], ob_in_cam=center_pose, scale=0.1, K=intrinsics, thickness=3, transparency=0, is_input_rgb=True)
+
+                video.append(vis)
+
+            video = np.stack(video, axis=0)
+            save_path = object_dir / "poses_optimized_vis.mp4"
+            iio.imwrite(save_path, video)
 
 if __name__ == "__main__":
     main()
