@@ -38,19 +38,33 @@ def transition_cost(prev_pose, cur_pose, mesh_diameter):
     return trans_cost + rot_cost
 
 
-def select_smooth_trajectory(all_poses, all_scores, mesh_diameter, trans_lambda=1.0, rot_lambda=1.0):
+def select_pose_trajectory(all_poses, all_scores, mesh_diameter, trans_lambda=1.0, rot_lambda=1.0):
     if len(all_poses) != len(all_scores):
         raise ValueError("all_poses and all_scores must have the same number of frames")
     if len(all_poses) == 0:
         return np.empty((0, 4, 4), dtype=np.float64)
 
-    poses_per_frame = [np.asarray(poses, dtype=np.float64).reshape(-1, 4, 4) for poses in all_poses]
-    scores_per_frame = [normalize_scores(scores) for scores in all_scores]
-    for frame_idx, (poses, scores) in enumerate(zip(poses_per_frame, scores_per_frame)):
-        if len(poses) == 0:
-            raise ValueError(f"frame {frame_idx} has no pose candidates")
+    poses_per_frame = []
+    scores_per_frame = []
+    valid_frame_indices = []
+    for frame_idx, (poses, scores) in enumerate(zip(all_poses, all_scores)):
+        poses = np.asarray(poses, dtype=np.float64).reshape(-1, 4, 4)
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
         if len(poses) != len(scores):
             raise ValueError(f"frame {frame_idx} pose and score counts do not match")
+
+        finite = np.isfinite(scores)
+        if len(poses) > 0:
+            finite = finite & np.isfinite(poses).all(axis=(1, 2))
+        if not finite.any():
+            continue
+
+        poses_per_frame.append(poses[finite])
+        scores_per_frame.append(normalize_scores(scores[finite]))
+        valid_frame_indices.append(frame_idx)
+
+    if len(valid_frame_indices) == 0:
+        raise ValueError("no valid pose candidates")
 
     dp = [scores_per_frame[0].copy()]
     backptr = []
@@ -84,7 +98,11 @@ def select_smooth_trajectory(all_poses, all_scores, mesh_diameter, trans_lambda=
         poses_per_frame[frame_idx][candidate_idx]
         for frame_idx, candidate_idx in enumerate(selected_indices)
     ]
-    return np.stack(selected_poses, axis=0)
+    selected_poses = np.stack(selected_poses, axis=0)
+
+    trajectory = np.zeros((len(all_poses), 4, 4), dtype=np.float64)
+    trajectory[valid_frame_indices] = selected_poses
+    return trajectory
 
 
 def main():
@@ -138,7 +156,7 @@ def main():
         all_poses.append(poses)
         all_scores.append(scores)
 
-    trajectory = select_smooth_trajectory(
+    trajectory = select_pose_trajectory(
         all_poses,
         all_scores,
         mesh_diameter=est.diameter,
@@ -148,6 +166,9 @@ def main():
 
     video = []
     for frame_idx, pose in enumerate(trajectory):
+        if not pose.any():
+            video.append(images[frame_idx])
+            continue
         center_pose = pose@np.linalg.inv(to_origin)
         vis = draw_posed_3d_box(intrinsics, img=images[frame_idx], ob_in_cam=center_pose, bbox=bbox)
         vis = draw_xyz_axis(images[frame_idx], ob_in_cam=center_pose, scale=0.1, K=intrinsics, thickness=3, transparency=0, is_input_rgb=True)
