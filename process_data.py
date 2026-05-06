@@ -8,22 +8,19 @@ from estimater import *
 from datareader import *
 
 
-def normalize_scores(scores):
+def normalize_scores(scores, temperature=1.0):
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     finite = np.isfinite(scores)
+
+    normalized = np.full_like(scores, -1e6, dtype=np.float64)
     if not finite.any():
         return np.zeros_like(scores, dtype=np.float64)
 
-    finite_scores = scores[finite]
-    max_score = finite_scores.max()
-    std_score = finite_scores.std()
-    if std_score < 1e-12:
-        normalized = np.full_like(scores, -1e6, dtype=np.float64)
-        normalized[finite] = 0.0
-        return normalized
+    x = scores[finite] / temperature
+    x = x - x.max()
+    log_probs = x - np.log(np.exp(x).sum())
 
-    normalized = (scores - max_score) / std_score
-    normalized[~finite] = -1e6
+    normalized[finite] = log_probs
     return normalized
 
 
@@ -41,7 +38,7 @@ def transition_cost(prev_pose, cur_pose, mesh_diameter):
     return trans_cost + rot_cost
 
 
-def select_smooth_trajectory(all_poses, all_scores, mesh_diameter, smoothness_lambda=1.0):
+def select_smooth_trajectory(all_poses, all_scores, mesh_diameter, trans_lambda=1.0, rot_lambda=1.0):
     if len(all_poses) != len(all_scores):
         raise ValueError("all_poses and all_scores must have the same number of frames")
     if len(all_poses) == 0:
@@ -60,12 +57,18 @@ def select_smooth_trajectory(all_poses, all_scores, mesh_diameter, smoothness_la
     for frame_idx in range(1, len(poses_per_frame)):
         prev_poses = poses_per_frame[frame_idx - 1]
         cur_poses = poses_per_frame[frame_idx]
-        transition = np.empty((len(prev_poses), len(cur_poses)), dtype=np.float64)
-        for i, prev_pose in enumerate(prev_poses):
-            for j, cur_pose in enumerate(cur_poses):
-                transition[i, j] = transition_cost(prev_pose, cur_pose, mesh_diameter)
+        diameter = max(float(mesh_diameter), 1e-12)
 
-        values = dp[-1][:, None] + scores_per_frame[frame_idx][None, :] - smoothness_lambda * transition
+        prev_t = prev_poses[:, :3, 3]
+        cur_t = cur_poses[:, :3, 3]
+        trans_cost = np.linalg.norm(cur_t[None] - prev_t[:, None], axis=-1) / diameter
+
+        prev_R = prev_poses[:, :3, :3]
+        cur_R = cur_poses[:, :3, :3]
+        traces = np.einsum("aij,bij->ab", prev_R, cur_R)
+        rot_cost = np.arccos(np.clip((traces - 1.0) / 2.0, -1.0, 1.0)) / np.pi
+
+        values = dp[-1][:, None] + scores_per_frame[frame_idx][None, :] - trans_lambda * trans_cost - rot_lambda * rot_cost
         best_prev = values.argmax(axis=0)
         dp.append(values[best_prev, np.arange(len(cur_poses))])
         backptr.append(best_prev)
@@ -139,7 +142,8 @@ def main():
         all_poses,
         all_scores,
         mesh_diameter=est.diameter,
-        smoothness_lambda=1.0,
+        trans_lambda=1.0,
+        rot_lambda=1.0,
     )
 
     video = []
