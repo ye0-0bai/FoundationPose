@@ -1,4 +1,5 @@
 import os
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,13 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from estimater import *
 from datareader import *
+
+
+def configure_quiet_logging():
+    logging.disable(logging.WARNING)
+    logging.getLogger().setLevel(logging.ERROR)
+    for handler in logging.getLogger().handlers:
+        handler.setLevel(logging.ERROR)
 
 
 def normalize_scores(scores, temperature=1.0):
@@ -239,6 +247,7 @@ def smooth_pose_trajectory(trajectory, max_invalid_gap=5, smooth_window=7, smoot
 
 
 def main():
+    configure_quiet_logging()
 
     data_root = Path("/data/datasets/DexYCB/processed")
     seq_dirs = sorted(data_root.glob("**/video"))
