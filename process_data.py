@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import imageio.v3 as iio
 import trimesh
+import pickle
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation, Slerp
 
@@ -263,7 +264,11 @@ def main():
         for object_dir in object_dirs:
             masks_path = object_dir / "masks.npz"
             mesh_path = object_dir / "mesh.glb"
-
+            
+            save_path = object_dir / "poses_optimized.npy"
+            if save_path.exists():
+                continue
+                
             intrinsics = np.load(intrinsics_path)
             intrinsics = intrinsics.astype(np.float64)
 
