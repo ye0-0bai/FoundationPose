@@ -85,6 +85,12 @@ class FoundationPose:
     return tf_to_center
 
 
+  def set_pose_last_from_model_pose(self, pose):
+    """Set tracking state from an object pose expressed for the original mesh."""
+    pose = torch.as_tensor(pose, device='cuda', dtype=torch.float).reshape(4,4)
+    self.pose_last = pose @ torch.linalg.inv(self.get_tf_to_centered_mesh())
+
+
   def to_device(self, s='cuda:0'):
     for k in self.__dict__:
       self.__dict__[k] = self.__dict__[k]
@@ -350,4 +356,3 @@ class FoundationPose:
       extra['vis'] = vis
     self.pose_last = pose
     return (pose@self.get_tf_to_centered_mesh()).data.cpu().numpy().reshape(4,4)
-

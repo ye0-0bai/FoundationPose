@@ -8,6 +8,7 @@ and writes an MP4 visualization with the estimated 3D bounding box and axes.
 import os
 import logging
 from pathlib import Path
+import argparse
 
 import numpy as np
 import imageio.v3 as iio
@@ -20,6 +21,10 @@ from estimater import *
 from datareader import *
 
 
+DEFAULT_SCFLOW2_CONFIG = "third_party/SCFlow2/configs/flow_refine/scflow2.py"
+DEFAULT_SCFLOW2_CHECKPOINT = "weights/scflow2_pretrained.pth"
+
+
 def configure_quiet_logging():
     """Suppress low-priority logging from dependencies during batch processing."""
 
@@ -29,17 +34,36 @@ def configure_quiet_logging():
         handler.setLevel(logging.ERROR)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Estimate and track object poses for processed DexYCB sequences."
+    )
+    parser.add_argument("--use_scflow2", action="store_true", help="Refine each tracked pose with SCFlow2.")
+    parser.add_argument("--scflow2-config", default=DEFAULT_SCFLOW2_CONFIG, help="SCFlow2 config path.")
+    parser.add_argument(
+        "--scflow2-checkpoint",
+        default=DEFAULT_SCFLOW2_CHECKPOINT,
+        help="SCFlow2 checkpoint path.",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Run pose registration, tracking, and visualization for each object.
 
     The input directory is expected to contain processed sequences with
     video frames, depths, camera intrinsics, and predicted object assets. For
     each object, the first frame is registered from its mask, subsequent frames
-    are tracked from the previous estimate, and results are skipped when an
-    existing ``poses.npy`` file is found.
+    are tracked from the previous estimate, optionally refined with SCFlow2,
+    and results are skipped when the mode-specific pose file is found.
     """
 
+    args = parse_args()
     configure_quiet_logging()
+    scflow2_refiner_cls = None
+    if args.use_scflow2:
+        from scflow2_online_refiner import SCFlow2OnlineRefiner
+        scflow2_refiner_cls = SCFlow2OnlineRefiner
 
     data_root = Path("/data/datasets/DexYCB/processed")
     seq_dirs = sorted(data_root.glob("**/video"))
@@ -50,13 +74,15 @@ def main():
         images_path = seq_dir / "video" / "images.mp4"
         depths_path = seq_dir / "video" / "depths.npy"
 
-        objects_root = seq_dir / "objects" / "predicted"
+        objects_root = seq_dir / "objects" / "gpt"
         object_dirs = sorted(objects_root.glob("object_*"))
         for object_dir in object_dirs:
             masks_path = object_dir / "masks.npz"
             mesh_path = object_dir / "mesh.glb"
 
-            save_path = object_dir / "poses.npy"
+            pose_filename = "poses_scflow2.npy" if args.use_scflow2 else "poses.npy"
+            video_filename = "poses_scflow2.mp4" if args.use_scflow2 else "poses.mp4"
+            save_path = object_dir / pose_filename
             if save_path.exists():
                 continue
 
@@ -95,6 +121,20 @@ def main():
             )
 
             os.makedirs(debug_dir, exist_ok=True)
+            scflow2_refiner = None
+            if args.use_scflow2:
+                try:
+                    scflow2_refiner = scflow2_refiner_cls(
+                        config_path=args.scflow2_config,
+                        checkpoint_path=args.scflow2_checkpoint,
+                        device="cuda",
+                    )
+                except Exception as exc:
+                    logging.error(
+                        "Could not initialize SCFlow2 for %s; keeping FoundationPose poses for this object: %s",
+                        object_dir,
+                        exc,
+                    )
 
             poses = []
             T = images.shape[0]
@@ -117,11 +157,24 @@ def main():
                         iteration=3
                     )
 
+                if scflow2_refiner is not None:
+                    refined_pose = scflow2_refiner.refine(
+                        rgb=images[frame_idx],
+                        depth_m=depths[frame_idx],
+                        K=intrinsics,
+                        mask=masks[frame_idx],
+                        pose_m=pose,
+                        mesh=mesh,
+                    )
+                    if refined_pose is not None:
+                        pose = refined_pose
+                        est.set_pose_last_from_model_pose(pose)
+
                 poses.append(pose)
 
             poses = np.stack(poses, axis=0)
 
-            save_path = object_dir / "poses.npy"
+            save_path = object_dir / pose_filename
             np.save(save_path, poses)
 
             video = []
@@ -133,7 +186,7 @@ def main():
                 video.append(vis)
 
             video = np.stack(video, axis=0)
-            save_path = object_dir / "poses.mp4"
+            save_path = object_dir / video_filename
             iio.imwrite(save_path, video)
 
 if __name__ == "__main__":
