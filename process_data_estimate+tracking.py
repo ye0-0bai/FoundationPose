@@ -1,3 +1,10 @@
+"""Estimate and track object poses for processed DexYCB sequences.
+
+This script scans the processed DexYCB dataset, runs FoundationPose on every
+predicted object mesh and visible mask sequence, saves per-frame object poses,
+and writes an MP4 visualization with the estimated 3D bounding box and axes.
+"""
+
 import os
 import logging
 from pathlib import Path
@@ -14,6 +21,8 @@ from datareader import *
 
 
 def configure_quiet_logging():
+    """Suppress low-priority logging from dependencies during batch processing."""
+
     logging.disable(logging.WARNING)
     logging.getLogger().setLevel(logging.ERROR)
     for handler in logging.getLogger().handlers:
@@ -21,6 +30,15 @@ def configure_quiet_logging():
 
 
 def main():
+    """Run pose registration, tracking, and visualization for each object.
+
+    The input directory is expected to contain processed sequences with
+    video frames, depths, camera intrinsics, and predicted object assets. For
+    each object, the first frame is registered from its mask, subsequent frames
+    are tracked from the previous estimate, and results are skipped when an
+    existing ``poses.npy`` file is found.
+    """
+
     configure_quiet_logging()
 
     data_root = Path("/data/datasets/DexYCB/processed")
@@ -37,16 +55,17 @@ def main():
         for object_dir in object_dirs:
             masks_path = object_dir / "masks.npz"
             mesh_path = object_dir / "mesh.glb"
-            
+
             save_path = object_dir / "poses.npy"
             if save_path.exists():
                 continue
-                
+
             intrinsics = np.load(intrinsics_path)
             intrinsics = intrinsics.astype(np.float64)
 
             images = iio.imread(images_path)
 
+            # Convert invalid depth values to 0 and scale millimeters to meters.
             depths = np.load(depths_path)
             depths[depths==65535] = 0
             depths = (depths.astype(np.float64)) / 1000.0
@@ -81,6 +100,7 @@ def main():
             T = images.shape[0]
             for frame_idx in range(T):
                 if frame_idx == 0:
+                    # Initialize the pose from the first visible object mask.
                     pose = est.register(
                         K=intrinsics,
                         rgb=images[frame_idx],
@@ -89,13 +109,14 @@ def main():
                         iteration=5,
                     )
                 else:
+                    # Track from the previous frame's pose estimate.
                     pose = est.track_one(
                         K=intrinsics,
                         rgb=images[frame_idx],
                         depth=depths[frame_idx],
                         iteration=3
                     )
-                    
+
                 poses.append(pose)
 
             poses = np.stack(poses, axis=0)
