@@ -4,7 +4,7 @@
 
 - Linux
 - conda
-- Python 3.9
+- Python 3.9（也可使用其他 Python 版本，但需要确保依赖版本兼容）
 - CUDA 12.1
 - PyTorch 2.4.1
 
@@ -74,7 +74,7 @@ conda install -c conda-forge eigen=3.4.0 -y
 先安装 `nvdiffrast`：
 
 ```bash
-python -m pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
+pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
 ```
 
 再安装 `pytorch3d`：
@@ -94,7 +94,7 @@ python -m pip install git+https://github.com/facebookresearch/pytorch3d.git --no
 执行下面的命令完成编译：
 
 ```bash
-CMAKE_PREFIX_PATH=$CONDA_PREFIX/lib/python3.9/site-packages/pybind11/share/cmake/pybind11 bash build_all_conda.sh
+CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir)" bash build_all_conda.sh
 ```
 
 ## 7. 安装完成验证
@@ -117,7 +117,7 @@ python -c "import torch; print(torch.__version__); print(torch.version.cuda)"
 再确认关键依赖和扩展可以正常导入：
 
 ```bash
-python -c "import pytorch3d; import nvdiffrast.torch as dr; import common; import gridencoder; print('install ok')"
+python -c "import pytorch3d; import nvdiffrast.torch as dr; import mycpp.build.mycpp as mycpp; import common; import gridencoder; assert hasattr(mycpp, 'cluster_poses'); print('install ok')"
 ```
 
 如果最后输出 `install ok`，说明这套安装流程已经基本可用。
@@ -126,5 +126,5 @@ python -c "import pytorch3d; import nvdiffrast.torch as dr; import common; impor
 
 1. 本文档只覆盖 `CUDA 12.1 + torch 2.4.1` 这一组已验证组合，其他版本不保证兼容。
 2. 命令中的 `--no-build-isolation` 不要去掉。这里的源码包需要复用当前环境中的 `torch`、`pybind11` 等依赖。
-3. 如果你修改了 Python 版本，`CMAKE_PREFIX_PATH` 中的 `python3.9` 路径也需要对应调整。
-4. 如果扩展编译失败，优先检查 `nvcc`、`g++`、`cmake`、`CONDA_PREFIX` 和 `eigen=3.4.0` 是否都正确可用。
+3. 如果切换了 Python 版本，需要重新执行 `build_all_conda.sh`，确保 `mycpp`、`common` 和 `gridencoder` 都生成了当前 Python 版本对应的 `.so` 文件。
+4. 如果扩展编译失败，优先检查 `nvcc`、`g++`、`cmake`、`CONDA_PREFIX`、`python -m pybind11 --cmakedir` 和 `eigen=3.4.0` 是否都正确可用。
