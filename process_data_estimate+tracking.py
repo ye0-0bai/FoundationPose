@@ -85,6 +85,7 @@ def main():
     # Build the expensive FoundationPose components on first real object use,
     # then switch object geometry via reset_object for the rest of this run.
     est = None
+    scflow2_refiner = None
 
     for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
         try:
@@ -152,21 +153,19 @@ def main():
                 to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
                 bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
 
-                scflow2_refiner = None
-                if args.use_scflow2:
+                if args.use_scflow2 and scflow2_refiner is None:
                     try:
-                        # SCFlow2 is optional; if initialization fails, keep the
-                        # baseline FoundationPose trajectory instead of aborting.
                         scflow2_refiner = scflow2_refiner_cls(
                             config_path=args.scflow2_config,
                             checkpoint_path=args.scflow2_checkpoint,
                             device="cuda",
                         )
                     except Exception as e:
-                        tqdm.tqdm.write(f"Failed to initialize SCFlow2 fo {object_dir.relative_to(data_root)}")
+                        tqdm.tqdm.write(f"Failed to initialize SCFlow2 for {object_dir.relative_to(data_root)}")
                         io_string = io.StringIO()
                         traceback.print_exc(file=io_string)
                         tqdm.tqdm.write(io_string.getvalue())
+                        raise SystemExit(1) from e
 
                 poses = []
                 T = images.shape[0]

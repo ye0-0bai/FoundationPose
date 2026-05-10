@@ -131,6 +131,63 @@ def _assigns_name_to_none(node, name):
     return False
 
 
+def _none_assignment_count(node, name):
+    count = 0
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if not (isinstance(child.value, ast.Constant) and child.value.value is None):
+            continue
+        for target in child.targets:
+            if isinstance(target, ast.Name) and target.id == name:
+                count += 1
+    return count
+
+
+def _is_scflow2_lazy_init_test(node):
+    if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.And):
+        return False
+
+    has_use_scflow2 = any(
+        isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "args"
+        and value.attr == "use_scflow2"
+        for value in node.values
+    )
+    has_refiner_none = any(
+        isinstance(value, ast.Compare)
+        and isinstance(value.left, ast.Name)
+        and value.left.id == "scflow2_refiner"
+        and len(value.ops) == 1
+        and isinstance(value.ops[0], ast.Is)
+        and len(value.comparators) == 1
+        and isinstance(value.comparators[0], ast.Constant)
+        and value.comparators[0].value is None
+        for value in node.values
+    )
+    return has_use_scflow2 and has_refiner_none
+
+
+def _contains_scflow2_constructor(node):
+    if isinstance(node, list):
+        node = ast.Module(body=node, type_ignores=[])
+    return any(
+        isinstance(child, ast.Call)
+        and _call_name(child.func) in {"SCFlow2OnlineRefiner", "scflow2_refiner_cls"}
+        for child in ast.walk(node)
+    )
+
+
+def _raises_system_exit(node):
+    return any(
+        isinstance(child, ast.Raise)
+        and isinstance(child.exc, ast.Call)
+        and _call_name(child.exc.func) == "SystemExit"
+        for child in ast.walk(node)
+    )
+
+
 class FoundationPoseReuseStaticTests(unittest.TestCase):
     def test_reset_object_clears_per_object_tracking_state(self):
         tree = _parse("estimater.py")
@@ -189,6 +246,24 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
             any(isinstance(stmt, ast.Continue) for stmt in skip_if.body),
             "overwrite-aware skip guard should continue when output exists",
         )
+
+    def test_processed_tracking_uses_lazy_first_object_scflow2(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        main = _find_function(tree, "main")
+        self.assertTrue(_assigns_name_to_none(main, "scflow2_refiner"))
+        self.assertEqual(_none_assignment_count(main, "scflow2_refiner"), 1)
+
+        object_loop = _for_loop_by_target(main, "object_dir")
+        lazy_init = _if_by_test(object_loop, _is_scflow2_lazy_init_test)
+
+        self.assertTrue(_contains_scflow2_constructor(lazy_init.body))
+
+        for child in ast.walk(object_loop):
+            if isinstance(child, ast.Try) and _contains_scflow2_constructor(child):
+                self.assertTrue(
+                    any(_raises_system_exit(handler) for handler in child.handlers),
+                    "SCFlow2 initialization failures should terminate instead of falling back",
+                )
 
 
 if __name__ == "__main__":
