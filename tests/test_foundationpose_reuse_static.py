@@ -188,6 +188,28 @@ def _raises_system_exit(node):
     )
 
 
+def _has_broad_exception_handler(node):
+    for child in ast.walk(node):
+        if not isinstance(child, ast.ExceptHandler):
+            continue
+        if child.type is None:
+            return True
+        if _call_name(child.type) in {"Exception", "BaseException"}:
+            return True
+    return False
+
+
+def _try_nodes_wrapping_call(node, call_name):
+    matches = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Try):
+            continue
+        calls = _calls_under(ast.Module(body=child.body, type_ignores=[]))
+        if call_name in calls:
+            matches.append(child)
+    return matches
+
+
 class FoundationPoseReuseStaticTests(unittest.TestCase):
     def test_reset_object_clears_per_object_tracking_state(self):
         tree = _parse("estimater.py")
@@ -264,6 +286,43 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
                     any(_raises_system_exit(handler) for handler in child.handlers),
                     "SCFlow2 initialization failures should terminate instead of falling back",
                 )
+
+    def test_scflow2_refine_raises_failures_for_contextual_callers(self):
+        tree = _parse("scflow2_online_refiner.py")
+        refine = _find_function(tree, "refine")
+
+        self.assertFalse(
+            _has_broad_exception_handler(refine),
+            "SCFlow2OnlineRefiner.refine should let callers add sequence/object/frame context",
+        )
+
+    def test_processed_tracking_logs_scflow2_frame_failures_and_continues(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        main = _find_function(tree, "main")
+        frame_loop = _for_loop_by_target(main, "frame_idx")
+        refine_try_nodes = _try_nodes_wrapping_call(frame_loop, "scflow2_refiner.refine")
+
+        self.assertEqual(
+            len(refine_try_nodes),
+            1,
+            "tracking should catch SCFlow2 refine failures at the frame level",
+        )
+
+        handler_calls = set()
+        handler_raises = []
+        for handler in refine_try_nodes[0].handlers:
+            handler_calls.update(_calls_under(handler))
+            handler_raises.extend(
+                child for child in ast.walk(handler) if isinstance(child, ast.Raise)
+            )
+
+        self.assertIn("traceback.print_exc", handler_calls)
+        self.assertIn("tqdm.tqdm.write", handler_calls)
+        self.assertEqual(
+            handler_raises,
+            [],
+            "frame-level SCFlow2 failures should keep the FoundationPose pose and continue",
+        )
 
 
 if __name__ == "__main__":

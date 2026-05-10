@@ -367,14 +367,13 @@ class SCFlow2OnlineRefiner:
         }
 
     def refine(self, rgb, depth_m, K, mask, pose_m, mesh):
-        """Return a refined meter pose, or ``None`` if this frame cannot refine."""
+        """Return a refined meter pose.
 
-        try:
-            self._ensure_single_mesh_renderer(mesh)
-            batch = self._make_batch(rgb, depth_m, K, mask, pose_m, mesh)
-            with self.torch.no_grad():
-                outputs = self.model(batch, return_loss=False)
-            return extract_first_pose_m(outputs)
-        except Exception as exc:
-            LOGGER.error("SCFlow2 refine failed; keeping FoundationPose pose: %s", exc)
-            return None
+        Callers handle failures so they can log sequence/object/frame context.
+        """
+
+        self._ensure_single_mesh_renderer(mesh)
+        batch = self._make_batch(rgb, depth_m, K, mask, pose_m, mesh)
+        with self.torch.no_grad():
+            outputs = self.model(batch, return_loss=False)
+        return extract_first_pose_m(outputs)

@@ -191,14 +191,25 @@ def main():
                     if scflow2_refiner is not None:
                         # Refine the current FoundationPose estimate with the
                         # same frame inputs before using it as tracking state.
-                        refined_pose = scflow2_refiner.refine(
-                            rgb=images[frame_idx],
-                            depth_m=depths[frame_idx],
-                            K=intrinsics,
-                            mask=masks[frame_idx],
-                            pose_m=pose,
-                            mesh=mesh,
-                        )
+                        try:
+                            refined_pose = scflow2_refiner.refine(
+                                rgb=images[frame_idx],
+                                depth_m=depths[frame_idx],
+                                K=intrinsics,
+                                mask=masks[frame_idx],
+                                pose_m=pose,
+                                mesh=mesh,
+                            )
+                        except Exception:
+                            tqdm.tqdm.write(
+                                "SCFlow2 refine failed for "
+                                f"{object_dir.relative_to(data_root)}, frame {frame_idx}; "
+                                "keeping FoundationPose pose"
+                            )
+                            io_string = io.StringIO()
+                            traceback.print_exc(file=io_string)
+                            tqdm.tqdm.write(io_string.getvalue())
+                            refined_pose = None
                         if refined_pose is not None:
                             pose = refined_pose
                             # Keep FoundationPose's internal tracker aligned
