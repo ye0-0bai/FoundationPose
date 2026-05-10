@@ -41,6 +41,11 @@ def parse_args():
         description="Estimate and track object poses for processed DexYCB sequences."
     )
     parser.add_argument("--use_scflow2", action="store_true", help="Refine each tracked pose with SCFlow2.")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Run pose estimation even when the output pose file already exists.",
+    )
     parser.add_argument("--scflow2-config", default=DEFAULT_SCFLOW2_CONFIG, help="SCFlow2 config path.")
     parser.add_argument(
         "--scflow2-checkpoint",
@@ -101,7 +106,7 @@ def main():
                 pose_filename = "poses_scflow2.npy" if args.use_scflow2 else "poses.npy"
                 video_filename = "poses_scflow2.mp4" if args.use_scflow2 else "poses.mp4"
                 save_path = object_dir / pose_filename
-                if save_path.exists():
+                if not args.overwrite and save_path.exists():
                     continue
 
                 # FoundationPose expects floating-point camera intrinsics.

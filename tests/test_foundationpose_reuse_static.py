@@ -82,6 +82,40 @@ def _if_by_test(node, predicate):
     raise AssertionError("matching if statement not found")
 
 
+def _is_overwrite_guarded_save_exists_test(node):
+    return (
+        isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.And)
+        and len(node.values) == 2
+        and isinstance(node.values[0], ast.UnaryOp)
+        and isinstance(node.values[0].op, ast.Not)
+        and isinstance(node.values[0].operand, ast.Attribute)
+        and isinstance(node.values[0].operand.value, ast.Name)
+        and node.values[0].operand.value.id == "args"
+        and node.values[0].operand.attr == "overwrite"
+        and isinstance(node.values[1], ast.Call)
+        and isinstance(node.values[1].func, ast.Attribute)
+        and node.values[1].func.attr == "exists"
+        and isinstance(node.values[1].func.value, ast.Name)
+        and node.values[1].func.value.id == "save_path"
+    )
+
+
+def _parser_add_argument_flags(function_node):
+    flags = set()
+    for child in ast.walk(function_node):
+        if not (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "add_argument"
+        ):
+            continue
+        for arg in child.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                flags.add(arg.value)
+    return flags
+
+
 def _assigns_name_to_none(node, name):
     for child in node.body:
         if not isinstance(child, ast.Assign):
@@ -138,6 +172,23 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
         calls = _calls_under(tree)
 
         self.assertNotIn("trimesh.primitives.Box", calls)
+
+    def test_processed_tracking_registers_overwrite_flag(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        parse_args = _find_function(tree, "parse_args")
+
+        self.assertIn("--overwrite", _parser_add_argument_flags(parse_args))
+
+    def test_processed_tracking_skip_guard_respects_overwrite(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        main = _find_function(tree, "main")
+        object_loop = _for_loop_by_target(main, "object_dir")
+        skip_if = _if_by_test(object_loop, _is_overwrite_guarded_save_exists_test)
+
+        self.assertTrue(
+            any(isinstance(stmt, ast.Continue) for stmt in skip_if.body),
+            "overwrite-aware skip guard should continue when output exists",
+        )
 
 
 if __name__ == "__main__":
