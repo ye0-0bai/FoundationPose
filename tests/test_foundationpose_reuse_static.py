@@ -246,6 +246,23 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
         self.assertIn("FoundationPose", init_calls)
         self.assertIn("est.reset_object", reuse_calls)
 
+    def test_pose_candidate_script_uses_lazy_first_object_foundationpose(self):
+        tree = _parse("get_all_pose_candidates_and_scores.py")
+        main = _find_function(tree, "main")
+        self.assertTrue(_assigns_name_to_none(main, "est"))
+
+        object_loop = _for_loop_by_target(main, "object_dir")
+        lazy_init = _if_by_test(object_loop, _is_est_none_test)
+
+        init_calls = _calls_under(ast.Module(body=lazy_init.body, type_ignores=[]))
+        reuse_calls = _calls_under(ast.Module(body=lazy_init.orelse, type_ignores=[]))
+
+        self.assertIn("ScorePredictor", init_calls)
+        self.assertIn("PoseRefinePredictor", init_calls)
+        self.assertIn("dr.RasterizeCudaContext", init_calls)
+        self.assertIn("FoundationPose", init_calls)
+        self.assertIn("est.reset_object", reuse_calls)
+
     def test_processed_tracking_does_not_use_temporary_box_mesh(self):
         tree = _parse("process_data_estimate+tracking.py")
         calls = _calls_under(tree)

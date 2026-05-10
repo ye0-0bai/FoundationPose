@@ -27,6 +27,12 @@ def main():
     seq_dirs = sorted(data_root.glob("**/video"))
     seq_dirs = [seq_dir.parent for seq_dir in seq_dirs]
 
+    code_dir = os.path.dirname(os.path.realpath(__file__))
+    debug_dir = f"{code_dir}/debug"
+    os.makedirs(debug_dir, exist_ok=True)
+
+    est = None
+
     for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
         try:
             intrinsics_path = seq_dir / "video" / "intrinsics.npy"
@@ -60,23 +66,26 @@ def main():
                 # to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
                 # bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
 
-                code_dir = os.path.dirname(os.path.realpath(__file__))
-                debug_dir = f"{code_dir}/debug"
-
-                scorer = ScorePredictor()
-                refiner = PoseRefinePredictor()
-                glctx = dr.RasterizeCudaContext()
-                est = FoundationPose(
-                    model_pts=mesh.vertices,
-                    model_normals=mesh.vertex_normals,
-                    mesh=mesh, scorer=scorer,
-                    refiner=refiner,
-                    debug_dir=debug_dir,
-                    debug=0,
-                    glctx=glctx,
-                )
-
-                os.makedirs(debug_dir, exist_ok=True)
+                if est is None:
+                    scorer = ScorePredictor()
+                    refiner = PoseRefinePredictor()
+                    glctx = dr.RasterizeCudaContext()
+                    est = FoundationPose(
+                        model_pts=mesh.vertices,
+                        model_normals=mesh.vertex_normals,
+                        mesh=mesh,
+                        scorer=scorer,
+                        refiner=refiner,
+                        debug_dir=debug_dir,
+                        debug=0,
+                        glctx=glctx,
+                    )
+                else:
+                    est.reset_object(
+                        model_pts=mesh.vertices,
+                        model_normals=mesh.vertex_normals,
+                        mesh=mesh,
+                    )
 
                 T = images.shape[0]
                 all_poses = []
