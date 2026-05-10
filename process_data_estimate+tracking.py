@@ -67,6 +67,8 @@ def main():
         from scflow2_online_refiner import SCFlow2OnlineRefiner
         scflow2_refiner_cls = SCFlow2OnlineRefiner
 
+    # Each processed sequence is identified by its video folder; the parent
+    # directory contains the matching objects, masks, and output locations.
     data_root = Path("/data/datasets/DexYCB/processed")
     seq_dirs = sorted(data_root.glob("**/video"))
     seq_dirs = [seq_dir.parent for seq_dir in seq_dirs]
@@ -80,18 +82,24 @@ def main():
             objects_root = seq_dir / "objects" / "gpt"
             object_dirs = sorted(objects_root.glob("object_*"))
             for object_dir in object_dirs:
+                # Every object is processed independently with its own mesh,
+                # visible masks, pose array, and rendered visualization video.
                 masks_path = object_dir / "masks.npz"
                 mesh_path = object_dir / "mesh.glb"
 
+                # Keep SCFlow2 outputs separate so the baseline tracking result
+                # can coexist with the refined result in the same object folder.
                 pose_filename = "poses_scflow2.npy" if args.use_scflow2 else "poses.npy"
                 video_filename = "poses_scflow2.mp4" if args.use_scflow2 else "poses.mp4"
                 save_path = object_dir / pose_filename
                 if save_path.exists():
                     continue
 
+                # FoundationPose expects floating-point camera intrinsics.
                 intrinsics = np.load(intrinsics_path)
                 intrinsics = intrinsics.astype(np.float64)
 
+                # RGB frames are loaded as a single T x H x W x 3 array.
                 images = iio.imread(images_path)
 
                 # Convert invalid depth values to 0 and scale millimeters to meters.
@@ -100,9 +108,12 @@ def main():
                 depths = (depths.astype(np.float64)) / 1000.0
                 depths[(depths<0.001) | (depths>=np.inf)] = 0
 
+                # Use the visible object masks predicted during preprocessing.
                 masks = np.load(masks_path)
                 masks = masks["masks_visible"]
 
+                # The oriented bounds provide a centered box for drawing the
+                # object after converting poses from mesh coordinates.
                 mesh = trimesh.load(mesh_path, force="mesh")
                 to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
                 bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
@@ -110,6 +121,8 @@ def main():
                 code_dir = os.path.dirname(os.path.realpath(__file__))
                 debug_dir = f"{code_dir}/debug"
 
+                # Build the FoundationPose estimator once per object because
+                # the model points, normals, and mesh are object-specific.
                 scorer = ScorePredictor()
                 refiner = PoseRefinePredictor()
                 glctx = dr.RasterizeCudaContext()
@@ -127,6 +140,8 @@ def main():
                 scflow2_refiner = None
                 if args.use_scflow2:
                     try:
+                        # SCFlow2 is optional; if initialization fails, keep the
+                        # baseline FoundationPose trajectory instead of aborting.
                         scflow2_refiner = scflow2_refiner_cls(
                             config_path=args.scflow2_config,
                             checkpoint_path=args.scflow2_checkpoint,
@@ -160,6 +175,8 @@ def main():
                         )
 
                     if scflow2_refiner is not None:
+                        # Refine the current FoundationPose estimate with the
+                        # same frame inputs before using it as tracking state.
                         refined_pose = scflow2_refiner.refine(
                             rgb=images[frame_idx],
                             depth_m=depths[frame_idx],
@@ -170,23 +187,29 @@ def main():
                         )
                         if refined_pose is not None:
                             pose = refined_pose
+                            # Keep FoundationPose's internal tracker aligned
+                            # with the refined pose for the next frame.
                             est.set_pose_last_from_model_pose(pose)
 
                     poses.append(pose)
 
                 poses = np.stack(poses, axis=0)
 
+                # Save the raw 4x4 object-in-camera pose for each frame.
                 save_path = object_dir / pose_filename
                 np.save(save_path, poses)
 
                 video = []
                 for frame_idx, pose in enumerate(poses):
+                    # Visualization helpers draw boxes around a centered mesh,
+                    # so convert from the original mesh pose first.
                     center_pose = pose@np.linalg.inv(to_origin)
                     vis = draw_posed_3d_box(intrinsics, img=images[frame_idx], ob_in_cam=center_pose, bbox=bbox)
                     vis = draw_xyz_axis(images[frame_idx], ob_in_cam=center_pose, scale=0.1, K=intrinsics, thickness=3, transparency=0, is_input_rgb=True)
 
                     video.append(vis)
 
+                # Write a compact MP4 next to the pose array for quick review.
                 video = np.stack(video, axis=0)
                 save_path = object_dir / video_filename
                 iio.imwrite(save_path, video)
