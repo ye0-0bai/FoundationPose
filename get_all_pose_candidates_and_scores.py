@@ -33,7 +33,7 @@ def main():
             images_path = seq_dir / "video" / "images.mp4"
             depths_path = seq_dir / "video" / "depths.npy"
 
-            objects_root = seq_dir / "objects" / "predicted"
+            objects_root = seq_dir / "objects" / "gpt"
             object_dirs = sorted(objects_root.glob("object_*"))
             for object_dir in object_dirs:
                 masks_path = object_dir / "masks.npz"
