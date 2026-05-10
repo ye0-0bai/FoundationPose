@@ -132,12 +132,11 @@ def main():
                             checkpoint_path=args.scflow2_checkpoint,
                             device="cuda",
                         )
-                    except Exception as exc:
-                        logging.error(
-                            "Could not initialize SCFlow2 for %s; keeping FoundationPose poses for this object: %s",
-                            object_dir,
-                            exc,
-                        )
+                    except Exception as e:
+                        tqdm.tqdm.write(f"Failed to initialize SCFlow2 fo {object_dir.relative_to(data_root)}")
+                        io_string = io.StringIO()
+                        traceback.print_exc(file=io_string)
+                        tqdm.tqdm.write(io_string.getvalue())
 
                 poses = []
                 T = images.shape[0]

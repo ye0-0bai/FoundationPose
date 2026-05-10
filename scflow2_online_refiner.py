@@ -243,14 +243,15 @@ class SCFlow2OnlineRefiner:
         self.torch = torch
         self.cfg = Config.fromfile(str(self.config_path))
         self._prepare_placeholder_renderer_mesh()
-        self.model = build_refiner(self.cfg.model)
-        fp16_cfg = self.cfg.get("fp16", None)
-        if fp16_cfg is not None:
-            wrap_fp16_model(self.model)
-        if hasattr(self.model, "load_checkpoint"):
-            self.model.load_checkpoint([str(self.checkpoint_path)])
-        else:
-            load_checkpoint(self.model, str(self.checkpoint_path), map_location=device)
+        with force_cpu_default_tensor_type(self.torch):
+            self.model = build_refiner(self.cfg.model)
+            fp16_cfg = self.cfg.get("fp16", None)
+            if fp16_cfg is not None:
+                wrap_fp16_model(self.model)
+            if hasattr(self.model, "load_checkpoint"):
+                self.model.load_checkpoint([str(self.checkpoint_path)])
+            else:
+                load_checkpoint(self.model, str(self.checkpoint_path), map_location=device)
         self.model.to(device)
         self.model.eval()
 
