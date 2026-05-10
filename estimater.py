@@ -42,6 +42,23 @@ class FoundationPose:
 
 
   def reset_object(self, model_pts, model_normals, symmetry_tfs=None, mesh=None):
+    old_mesh_path = getattr(self, 'mesh_path', None)
+    if old_mesh_path is not None and os.path.exists(old_mesh_path):
+      try:
+        os.remove(old_mesh_path)
+      except OSError as e:
+        logging.warning(f'Failed to remove previous temporary mesh {old_mesh_path}: {e}')
+
+    self.pose_last = None
+    self.poses = None
+    self.scores = None
+    self.best_id = None
+    self.ob_id = None
+    self.ob_mask = None
+    self.K = None
+    self.H = None
+    self.W = None
+
     max_xyz = mesh.vertices.max(axis=0)
     min_xyz = mesh.vertices.min(axis=0)
     self.model_center = (min_xyz+max_xyz)/2

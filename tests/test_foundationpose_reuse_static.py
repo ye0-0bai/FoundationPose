@@ -1,0 +1,144 @@
+import ast
+from pathlib import Path
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _parse(path):
+    return ast.parse((ROOT / path).read_text())
+
+
+def _find_function(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"Function {name} not found")
+
+
+def _assigned_self_attrs(node):
+    attrs = set()
+    for child in ast.walk(node):
+        targets = []
+        if isinstance(child, ast.Assign):
+            targets = child.targets
+        elif isinstance(child, ast.AnnAssign):
+            targets = [child.target]
+        elif isinstance(child, ast.AugAssign):
+            targets = [child.target]
+
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                attrs.add(target.attr)
+    return attrs
+
+
+def _call_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_call_name(node.value)}.{node.attr}"
+    return ""
+
+
+def _calls_under(node):
+    return {
+        _call_name(child.func)
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+    }
+
+
+def _for_loop_by_target(node, target_name):
+    for child in ast.walk(node):
+        if isinstance(child, ast.For) and isinstance(child.target, ast.Name):
+            if child.target.id == target_name:
+                return child
+    raise AssertionError(f"for loop over {target_name} not found")
+
+
+def _is_est_none_test(node):
+    return (
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "est"
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Is)
+        and len(node.comparators) == 1
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value is None
+    )
+
+
+def _if_by_test(node, predicate):
+    for child in ast.walk(node):
+        if isinstance(child, ast.If) and predicate(child.test):
+            return child
+    raise AssertionError("matching if statement not found")
+
+
+def _assigns_name_to_none(node, name):
+    for child in node.body:
+        if not isinstance(child, ast.Assign):
+            continue
+        if not (
+            len(child.targets) == 1
+            and isinstance(child.targets[0], ast.Name)
+            and child.targets[0].id == name
+        ):
+            continue
+        if isinstance(child.value, ast.Constant) and child.value.value is None:
+            return True
+    return False
+
+
+class FoundationPoseReuseStaticTests(unittest.TestCase):
+    def test_reset_object_clears_per_object_tracking_state(self):
+        tree = _parse("estimater.py")
+        reset_object = _find_function(tree, "reset_object")
+
+        self.assertTrue(
+            {
+                "pose_last",
+                "poses",
+                "scores",
+                "best_id",
+                "ob_id",
+                "ob_mask",
+                "K",
+                "H",
+                "W",
+            }.issubset(_assigned_self_attrs(reset_object))
+        )
+
+    def test_processed_tracking_uses_lazy_first_object_foundationpose(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        main = _find_function(tree, "main")
+        self.assertTrue(_assigns_name_to_none(main, "est"))
+
+        object_loop = _for_loop_by_target(main, "object_dir")
+        lazy_init = _if_by_test(object_loop, _is_est_none_test)
+
+        init_calls = _calls_under(ast.Module(body=lazy_init.body, type_ignores=[]))
+        reuse_calls = _calls_under(ast.Module(body=lazy_init.orelse, type_ignores=[]))
+
+        self.assertIn("ScorePredictor", init_calls)
+        self.assertIn("PoseRefinePredictor", init_calls)
+        self.assertIn("dr.RasterizeCudaContext", init_calls)
+        self.assertIn("FoundationPose", init_calls)
+        self.assertIn("est.reset_object", reuse_calls)
+
+    def test_processed_tracking_does_not_use_temporary_box_mesh(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        calls = _calls_under(tree)
+
+        self.assertNotIn("trimesh.primitives.Box", calls)
+
+
+if __name__ == "__main__":
+    unittest.main()
