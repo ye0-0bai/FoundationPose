@@ -54,6 +54,22 @@ def _calls_under(node):
     }
 
 
+def _constants_under(node):
+    return {
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    }
+
+
+def _name_loads_under(node):
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
 def _for_loop_by_target(node, target_name):
     for child in ast.walk(node):
         if isinstance(child, ast.For) and isinstance(child.target, ast.Name):
@@ -297,12 +313,18 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
 
         self.assertTrue(_contains_scflow2_constructor(lazy_init.body))
 
-        for child in ast.walk(object_loop):
-            if isinstance(child, ast.Try) and _contains_scflow2_constructor(child):
-                self.assertTrue(
-                    any(_raises_system_exit(handler) for handler in child.handlers),
-                    "SCFlow2 initialization failures should terminate instead of falling back",
-                )
+        constructor_try_nodes = [
+            child
+            for child in ast.walk(object_loop)
+            if isinstance(child, ast.Try) and _contains_scflow2_constructor(child)
+        ]
+        self.assertTrue(
+            any(
+                any(_raises_system_exit(handler) for handler in child.handlers)
+                for child in constructor_try_nodes
+            ),
+            "SCFlow2 initialization failures should terminate instead of falling back",
+        )
 
     def test_scflow2_refine_raises_failures_for_contextual_callers(self):
         tree = _parse("scflow2_online_refiner.py")
@@ -340,6 +362,47 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
             [],
             "frame-level SCFlow2 failures should keep the FoundationPose pose and continue",
         )
+
+    def test_processed_tracking_defines_timing_summary_helper(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        summary = _find_function(tree, "print_timing_summary")
+        calls = _calls_under(summary)
+        constants = _constants_under(summary)
+
+        self.assertIn("tqdm.tqdm.write", calls)
+        self.assertIn("avg_seconds", constants)
+        self.assertIn("No processed objects; timing averages are unavailable.", constants)
+        self.assertTrue(
+            any(
+                value.startswith("Overall average seconds per processed object:")
+                for value in constants
+            )
+        )
+
+    def test_processed_tracking_records_expected_timing_stages(self):
+        tree = _parse("process_data_estimate+tracking.py")
+        main = _find_function(tree, "main")
+        constants = _constants_under(main)
+        loaded_names = _name_loads_under(main)
+
+        self.assertTrue(
+            {
+                "input_loading",
+                "mesh_setup",
+                "scflow2_initialization",
+                "register",
+                "track_one",
+                "scflow2_refinement",
+                "pose_saving",
+                "visualization_rendering",
+                "video_writing",
+                "total_processed_object",
+            }.issubset(constants)
+        )
+        self.assertIn("processed_objects", loaded_names)
+        self.assertIn("skipped_objects", loaded_names)
+        self.assertIn("failed_objects", loaded_names)
+        self.assertIn("time.perf_counter", _calls_under(main))
 
 
 if __name__ == "__main__":
