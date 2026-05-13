@@ -17,6 +17,13 @@ def _find_function(tree, name):
     raise AssertionError(f"Function {name} not found")
 
 
+def _import_from_module(tree, module_name):
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == module_name
+    ]
+
+
 def _call_name(node):
     if isinstance(node, ast.Name):
         return node.id
@@ -119,6 +126,22 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         self.assertNotIn("PoseRefinePredictor", calls)
         self.assertNotIn("dr.RasterizeCudaContext", calls)
         self.assertNotIn("est.register_all", calls)
+
+    def test_inlines_trajectory_optimization_helpers(self):
+        tree = _parse("optimize_precomputed_poses.py")
+        process_data_imports = _import_from_module(tree, "process_data")
+
+        imported_names = {
+            alias.name
+            for node in process_data_imports
+            for alias in node.names
+        }
+
+        self.assertIn("configure_quiet_logging", imported_names)
+        self.assertNotIn("select_pose_trajectory", imported_names)
+        self.assertNotIn("smooth_pose_trajectory", imported_names)
+        _find_function(tree, "select_pose_trajectory")
+        _find_function(tree, "smooth_pose_trajectory")
 
     def test_traverses_gpt_objects_and_writes_expected_outputs(self):
         tree = _parse("optimize_precomputed_poses.py")
