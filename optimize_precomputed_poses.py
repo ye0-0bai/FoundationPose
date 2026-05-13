@@ -1,4 +1,38 @@
-"""Optimize precomputed pose candidates for processed DexYCB objects."""
+"""Optimize precomputed pose candidates for processed DexYCB objects.
+
+当前优化逻辑说明:
+
+本脚本不重新估计单帧 pose，而是在预计算得到的每帧候选 pose 集合
+``all_poses&scores.pkl`` 上做后处理优化。整体流程分为两级:
+
+1. 轨迹选择:
+   - 对每一帧保留有限且数值有效的候选 pose 与 score。
+   - 将单帧 score 归一化为 log-probability，作为候选本身的置信度项。
+   - 使用动态规划从所有有效帧中选择一条全局最优候选轨迹，而不是逐帧
+     贪心选择最高分候选。
+   - 相邻帧转移代价由两部分组成:
+       translation_cost = ||t_cur - t_prev|| / mesh_diameter
+       rotation_cost = angle(R_prev, R_cur) / pi
+     其中 mesh_diameter 用于把不同尺寸物体的平移跳变归一到可比较尺度。
+   - 当前目标相当于最大化:
+       sum(normalized_score)
+       - trans_lambda * sum(translation_cost)
+       - rot_lambda * sum(rotation_cost)
+     因此 trans_lambda 与 rot_lambda 越大，轨迹越偏向时间连续；越小，越
+     偏向逐帧候选分数。
+   - 没有有效候选的帧不参与动态规划，输出轨迹中这些帧先保留为全零 pose。
+
+2. 轨迹后处理:
+   - 仅对长度不超过 max_invalid_gap 的无效短缺口做插值: 平移线性插值，
+     旋转使用 Slerp。
+   - 对连续有效片段做 Savitzky-Golay 平滑: 平移直接平滑，旋转先转为四元数
+     并处理符号连续性后再平滑和归一化。
+   - 超过 max_invalid_gap 的长缺失区间仍保持全零 pose，避免在缺少可靠候选
+     的区域生成过度猜测的轨迹。
+
+脚本最终保存 ``poses_optimized.npy`` 供下游使用，并渲染
+``poses_optimized.mp4`` 作为人工检查当前优化方案效果的可视化结果。
+"""
 
 import argparse
 import io
