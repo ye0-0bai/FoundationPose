@@ -1,6 +1,7 @@
 """Visualize per-frame score distribution for precomputed pose candidates."""
 
 import argparse
+import csv
 import io
 import pickle
 import traceback
@@ -17,6 +18,8 @@ import tqdm
 DEFAULT_DATA_ROOT = "/data/datasets/DexYCB/processed"
 CANDIDATES_FILENAME = "all_poses&scores.pkl"
 DEBUG_DIRNAME = "debug"
+CSV_FILENAME = "score_entropy_by_frame.csv"
+CSV_FIELDNAMES = ["seq_dir", "object_dir", "object_name", "frame_idx", "entropy_nats"]
 ENTROPY_FILENAME = "score_entropy.png"
 HISTOGRAM_DIRNAME = "score_histograms"
 HISTOGRAM_FILENAME = "frame_{frame_idx:06d}.png"
@@ -85,6 +88,32 @@ def entropy_per_frame(all_scores):
     return np.array([score_entropy(scores) for scores in all_scores], dtype=np.float64)
 
 
+def entropy_records(object_dir, entropies):
+    """Return CSV-ready entropy records for one processed object directory."""
+    object_dir = Path(object_dir)
+    seq_dir = object_dir.parents[2]
+    return [
+        {
+            "seq_dir": str(seq_dir),
+            "object_dir": str(object_dir),
+            "object_name": object_dir.name,
+            "frame_idx": frame_idx,
+            "entropy_nats": entropy,
+        }
+        for frame_idx, entropy in enumerate(entropies)
+    ]
+
+
+def write_entropy_csv(records, csv_path):
+    """Write all per-frame entropy records to a CSV file."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(records)
+
+
 def plot_entropy_curve(entropies, save_path):
     """Write a full-sequence entropy curve PNG."""
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,21 +178,22 @@ def process_object(object_dir, args):
     candidates_path = object_dir / CANDIDATES_FILENAME
     if not candidates_path.exists():
         tqdm.tqdm.write(f"Missing {candidates_path}; skipping")
-        return "skipped_missing_candidates"
+        return "skipped_missing_candidates", []
 
     all_scores = load_scores(candidates_path)
     frame_count = len(all_scores)
+    entropies = entropy_per_frame(all_scores)
+    records = entropy_records(object_dir, entropies)
 
     if not args.overwrite and expected_outputs_exist(object_dir, frame_count):
-        return "skipped_existing"
+        return "skipped_existing", records
 
-    entropies = entropy_per_frame(all_scores)
     entropy_path, histogram_paths = output_paths(object_dir, frame_count)
     plot_entropy_curve(entropies, entropy_path)
     for scores, histogram_path in zip(all_scores, histogram_paths):
         plot_score_histogram(scores, histogram_path, args.hist_bins)
 
-    return "processed"
+    return "processed", records
 
 
 def main():
@@ -173,19 +203,23 @@ def main():
     data_root = Path(args.data_root)
     seq_dirs = sorted(data_root.glob("**/video"))
     seq_dirs = [seq_dir.parent for seq_dir in seq_dirs]
+    records = []
 
     for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
         try:
             objects_root = seq_dir / "objects" / "gpt"
             object_dirs = sorted(objects_root.glob("object_*"))
             for object_dir in object_dirs:
-                process_object(object_dir, args)
+                _, object_records = process_object(object_dir, args)
+                records.extend(object_records)
 
         except Exception:
             tqdm.tqdm.write(f"Failed to process {seq_dir.relative_to(data_root)}")
             io_string = io.StringIO()
             traceback.print_exc(file=io_string)
             tqdm.tqdm.write(io_string.getvalue())
+
+    write_entropy_csv(records, Path(__file__).resolve().parent / DEBUG_DIRNAME / CSV_FILENAME)
 
 
 if __name__ == "__main__":
