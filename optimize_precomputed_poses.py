@@ -38,6 +38,7 @@ import argparse
 import io
 import pickle
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 import imageio.v3 as iio
@@ -55,6 +56,43 @@ DEFAULT_DATA_ROOT = "/data/datasets/DexYCB/processed"
 CANDIDATES_FILENAME = "all_poses&scores.pkl"
 POSES_FILENAME = "poses_optimized.npy"
 VIDEO_FILENAME = "poses_optimized.mp4"
+
+
+# ---------------------------------------------------------------------------
+# Configuration and CLI
+
+
+@dataclass(frozen=True)
+class OptimizationConfig:
+    """Trajectory-selection and smoothing parameters."""
+
+    max_invalid_gap: int = 5
+    smooth_window: int = 7
+    smooth_polyorder: int = 2
+    trans_lambda: float = 1.0
+    rot_lambda: float = 1.0
+
+
+@dataclass(frozen=True)
+class ObjectPaths:
+    """Filesystem paths for one processed object directory."""
+
+    object_dir: Path
+    mesh: Path
+    candidates: Path
+    optimized_poses: Path
+    optimized_video: Path
+
+    @classmethod
+    def from_object_dir(cls, object_dir):
+        object_dir = Path(object_dir)
+        return cls(
+            object_dir=object_dir,
+            mesh=object_dir / "mesh.glb",
+            candidates=object_dir / CANDIDATES_FILENAME,
+            optimized_poses=object_dir / POSES_FILENAME,
+            optimized_video=object_dir / VIDEO_FILENAME,
+        )
 
 
 def parse_args():
@@ -118,6 +156,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def optimization_config_from_args(args):
+    """Build an explicit optimization config from a parsed CLI namespace."""
+    return OptimizationConfig(
+        max_invalid_gap=args.max_invalid_gap,
+        smooth_window=args.smooth_window,
+        smooth_polyorder=args.smooth_polyorder,
+        trans_lambda=args.trans_lambda,
+        rot_lambda=args.rot_lambda,
+    )
+
+
+def ensure_optimization_config(config_or_args):
+    """Accept a config or legacy argparse namespace and return config."""
+    if isinstance(config_or_args, OptimizationConfig):
+        return config_or_args
+    return optimization_config_from_args(config_or_args)
+
+
+# ---------------------------------------------------------------------------
+# Candidate data loading and validation
+
+
 def load_pose_candidates(candidates_path):
     """Load pose candidates and confidence scores from a pickle file.
 
@@ -170,6 +230,65 @@ def normalize_scores(scores, temperature=1.0):
 
     normalized[finite] = log_probs
     return normalized
+
+
+def finite_candidate_mask(poses, scores):
+    """Return candidates with finite score and finite pose matrix entries."""
+    finite = np.isfinite(scores)
+    if len(poses) > 0:
+        finite = finite & np.isfinite(poses).all(axis=(1, 2))
+    return finite
+
+
+def clean_pose_candidates(all_poses, all_scores):
+    """Filter invalid candidates and collect frame indices used by DP."""
+    if len(all_poses) != len(all_scores):
+        raise ValueError("all_poses and all_scores must have the same number of frames")
+
+    poses_per_frame = []
+    scores_per_frame = []
+    valid_frame_indices = []
+    for frame_idx, (poses, scores) in enumerate(zip(all_poses, all_scores)):
+        poses = np.asarray(poses, dtype=np.float64).reshape(-1, 4, 4)
+        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+        if len(poses) != len(scores):
+            raise ValueError(f"frame {frame_idx} pose and score counts do not match")
+
+        finite = finite_candidate_mask(poses, scores)
+        if not finite.any():
+            continue
+
+        poses_per_frame.append(poses[finite])
+        scores_per_frame.append(normalize_scores(scores[finite]))
+        valid_frame_indices.append(frame_idx)
+
+    return poses_per_frame, scores_per_frame, valid_frame_indices
+
+
+def transition_cost_matrix(prev_poses, cur_poses, mesh_diameter):
+    """Compute pairwise normalized translation and rotation transition costs."""
+    diameter = max(float(mesh_diameter), 1e-12)
+
+    prev_t = prev_poses[:, :3, 3]
+    cur_t = cur_poses[:, :3, 3]
+    trans_cost = np.linalg.norm(cur_t[None] - prev_t[:, None], axis=-1) / diameter
+
+    prev_R = prev_poses[:, :3, :3]
+    cur_R = cur_poses[:, :3, :3]
+    traces = np.einsum("aij,bij->ab", prev_R, cur_R)
+    rot_cost = np.arccos(np.clip((traces - 1.0) / 2.0, -1.0, 1.0)) / np.pi
+    return trans_cost, rot_cost
+
+
+def build_trajectory(all_frame_count, valid_frame_indices, selected_poses):
+    """Place selected poses back into a full-length zero-initialized trajectory."""
+    trajectory = np.zeros((all_frame_count, 4, 4), dtype=np.float64)
+    trajectory[valid_frame_indices] = selected_poses
+    return trajectory
+
+
+# ---------------------------------------------------------------------------
+# Trajectory post-processing helpers
 
 
 def pose_valid_mask(trajectory):
@@ -294,6 +413,10 @@ def smooth_pose_segment(trajectory, start, end, smooth_window, smooth_polyorder)
     trajectory[start:end, 3, :] = [0.0, 0.0, 0.0, 1.0]
 
 
+# ---------------------------------------------------------------------------
+# Trajectory selection and optimization
+
+
 def select_pose_trajectory(
     all_poses,
     all_scores,
@@ -325,28 +448,10 @@ def select_pose_trajectory(
     if len(all_poses) == 0:
         return np.empty((0, 4, 4), dtype=np.float64)
 
-    poses_per_frame = []
-    scores_per_frame = []
-    valid_frame_indices = []
-    for frame_idx, (poses, scores) in enumerate(zip(all_poses, all_scores)):
-        poses = np.asarray(poses, dtype=np.float64).reshape(-1, 4, 4)
-        scores = np.asarray(scores, dtype=np.float64).reshape(-1)
-        if len(poses) != len(scores):
-            raise ValueError(f"frame {frame_idx} pose and score counts do not match")
-
-        # Dynamic programming should only see candidates that are numerically
-        # valid in both score and pose entries; invalid frames are skipped.
-        finite = np.isfinite(scores)
-        if len(poses) > 0:
-            finite = finite & np.isfinite(poses).all(axis=(1, 2))
-        if not finite.any():
-            continue
-
-        poses_per_frame.append(poses[finite])
-        # Log-probabilities make per-frame confidence terms comparable even
-        # when different frames produce different raw score scales.
-        scores_per_frame.append(normalize_scores(scores[finite]))
-        valid_frame_indices.append(frame_idx)
+    poses_per_frame, scores_per_frame, valid_frame_indices = clean_pose_candidates(
+        all_poses,
+        all_scores,
+    )
 
     if len(valid_frame_indices) == 0:
         raise ValueError("no valid pose candidates")
@@ -356,18 +461,11 @@ def select_pose_trajectory(
     for frame_idx in range(1, len(poses_per_frame)):
         prev_poses = poses_per_frame[frame_idx - 1]
         cur_poses = poses_per_frame[frame_idx]
-        diameter = max(float(mesh_diameter), 1e-12)
-
-        prev_t = prev_poses[:, :3, 3]
-        cur_t = cur_poses[:, :3, 3]
-        trans_cost = np.linalg.norm(cur_t[None] - prev_t[:, None], axis=-1) / diameter
-
-        prev_R = prev_poses[:, :3, :3]
-        cur_R = cur_poses[:, :3, :3]
-        # The pairwise transition matrix lets DP compare every previous
-        # candidate against every current candidate in one vectorized step.
-        traces = np.einsum("aij,bij->ab", prev_R, cur_R)
-        rot_cost = np.arccos(np.clip((traces - 1.0) / 2.0, -1.0, 1.0)) / np.pi
+        trans_cost, rot_cost = transition_cost_matrix(
+            prev_poses,
+            cur_poses,
+            mesh_diameter,
+        )
 
         values = (
             dp[-1][:, None]
@@ -393,10 +491,7 @@ def select_pose_trajectory(
         for frame_idx, candidate_idx in enumerate(selected_indices)
     ]
     selected_poses = np.stack(selected_poses, axis=0)
-
-    trajectory = np.zeros((len(all_poses), 4, 4), dtype=np.float64)
-    trajectory[valid_frame_indices] = selected_poses
-    return trajectory
+    return build_trajectory(len(all_poses), valid_frame_indices, selected_poses)
 
 
 def smooth_pose_trajectory(
@@ -452,7 +547,7 @@ def smooth_pose_trajectory(
     return smoothed
 
 
-def optimize_pose_candidates(all_poses, all_scores, mesh, args):
+def optimize_pose_candidates(all_poses, all_scores, mesh, config):
     """Select and smooth the best pose trajectory for one object.
 
     Args:
@@ -462,11 +557,14 @@ def optimize_pose_candidates(all_poses, all_scores, mesh, args):
             with ``all_poses``.
         mesh (trimesh.Trimesh): Object mesh used to normalize translation
             transition costs.
-        args (argparse.Namespace): Optimization and smoothing parameters.
+        config (OptimizationConfig | argparse.Namespace): Optimization and
+            smoothing parameters. argparse namespaces are accepted for
+            compatibility with the original call site.
 
     Returns:
         np.ndarray: Optimized pose trajectory with shape ``(T, 4, 4)``.
     """
+    config = ensure_optimization_config(config)
     # The mesh diameter puts translation jumps on a scale comparable across
     # objects, so large and small meshes can use the same penalty weights.
     mesh_diameter = compute_mesh_diameter(
@@ -479,30 +577,36 @@ def optimize_pose_candidates(all_poses, all_scores, mesh, args):
         all_poses,
         all_scores,
         mesh_diameter=mesh_diameter,
-        trans_lambda=args.trans_lambda,
-        rot_lambda=args.rot_lambda,
+        trans_lambda=config.trans_lambda,
+        rot_lambda=config.rot_lambda,
     )
     # Then interpolate only short invalid gaps and smooth continuous valid
     # segments; long missing regions remain invalid to avoid hallucinated poses.
     return smooth_pose_trajectory(
         trajectory,
-        max_invalid_gap=args.max_invalid_gap,
-        smooth_window=args.smooth_window,
-        smooth_polyorder=args.smooth_polyorder,
+        max_invalid_gap=config.max_invalid_gap,
+        smooth_window=config.smooth_window,
+        smooth_polyorder=config.smooth_polyorder,
     )
 
 
-def render_optimized_poses(seq_dir, object_dir, mesh, trajectory):
+# ---------------------------------------------------------------------------
+# Rendering
+
+
+def render_optimized_poses(seq_dir, object_paths, mesh, trajectory):
     """Render an RGB video overlay for an optimized object trajectory.
 
     Args:
         seq_dir (Path): Sequence directory containing the ``video`` folder.
-        object_dir (Path): Object output directory where the rendered video is
-            written.
+        object_paths (ObjectPaths): Object paths including rendered video path.
         mesh (trimesh.Trimesh): Object mesh used to derive the 3D bounding box.
         trajectory (np.ndarray): Optimized pose trajectory with shape
             ``(T, 4, 4)``. All-zero poses are treated as invalid frames.
     """
+    if not isinstance(object_paths, ObjectPaths):
+        object_paths = ObjectPaths.from_object_dir(object_paths)
+
     # The optimized overlay uses the original sequence video and camera
     # intrinsics so the output can be inspected directly against RGB frames.
     intrinsics_path = seq_dir / "video" / "intrinsics.npy"
@@ -550,7 +654,11 @@ def render_optimized_poses(seq_dir, object_dir, mesh, trajectory):
         video.append(vis)
 
     # Stack the per-frame overlays back into a video tensor before writing MP4.
-    iio.imwrite(object_dir / VIDEO_FILENAME, np.stack(video, axis=0))
+    iio.imwrite(object_paths.optimized_video, np.stack(video, axis=0))
+
+
+# ---------------------------------------------------------------------------
+# Object and batch processing
 
 
 def process_object(seq_dir, object_dir, args):
@@ -568,28 +676,30 @@ def process_object(seq_dir, object_dir, args):
         str: Processing status. One of ``skipped_existing``,
         ``skipped_missing_candidates``, or ``processed``.
     """
+    object_paths = ObjectPaths.from_object_dir(object_dir)
+
     # Skip completed objects unless the caller explicitly requests regeneration.
-    save_path = object_dir / POSES_FILENAME
+    save_path = object_paths.optimized_poses
     if not args.overwrite and save_path.exists():
         return "skipped_existing"
 
     # Some object directories may not have candidate files, especially during
     # interrupted preprocessing runs; report and continue with other objects.
-    candidates_path = object_dir / CANDIDATES_FILENAME
+    candidates_path = object_paths.candidates
     if not candidates_path.exists():
         tqdm.tqdm.write(f"Missing {candidates_path}; skipping")
         return "skipped_missing_candidates"
 
     # Load all object-specific inputs before running the optimization pipeline.
-    mesh_path = object_dir / "mesh.glb"
+    config = ensure_optimization_config(args)
     all_poses, all_scores = load_pose_candidates(candidates_path)
-    mesh = trimesh.load(mesh_path, force="mesh")
-    trajectory = optimize_pose_candidates(all_poses, all_scores, mesh, args)
+    mesh = trimesh.load(object_paths.mesh, force="mesh")
+    trajectory = optimize_pose_candidates(all_poses, all_scores, mesh, config)
 
     # Save the numeric trajectory for downstream use and the rendered video for
     # human quality control.
     np.save(save_path, trajectory)
-    render_optimized_poses(seq_dir, object_dir, mesh, trajectory)
+    render_optimized_poses(seq_dir, object_paths, mesh, trajectory)
     return "processed"
 
 

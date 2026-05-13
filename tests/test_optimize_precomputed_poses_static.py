@@ -142,6 +142,18 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         self.assertNotIn("smooth_pose_trajectory", imported_names)
         _find_function(tree, "select_pose_trajectory")
         _find_function(tree, "smooth_pose_trajectory")
+        _find_function(tree, "clean_pose_candidates")
+        _find_function(tree, "transition_cost_matrix")
+
+    def test_keeps_single_file_config_and_object_path_helpers(self):
+        tree = _parse("optimize_precomputed_poses.py")
+        class_names = {
+            node.name for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+        }
+
+        self.assertIn("OptimizationConfig", class_names)
+        self.assertIn("ObjectPaths", class_names)
+        _find_function(tree, "optimization_config_from_args")
 
     def test_traverses_gpt_objects_and_writes_expected_outputs(self):
         tree = _parse("optimize_precomputed_poses.py")
