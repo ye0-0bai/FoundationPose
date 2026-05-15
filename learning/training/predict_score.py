@@ -69,6 +69,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   bs = 512
   rgb_rs = []
   depth_rs = []
+  mask_rs = []
   xyz_map_rs = []
 
   bbox2d_crop = torch.as_tensor(np.array([0, 0, cfg['input_resize'][0]-1, cfg['input_resize'][1]-1]).reshape(2,2), device='cuda', dtype=torch.float)
@@ -79,10 +80,12 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
     rgb_r, depth_r, normal_r = nvdiffrast_render(K=K, H=H, W=W, ob_in_cams=poseAs[b:b+bs], context='cuda', get_normal=cfg['use_normal'], glctx=glctx, mesh_tensors=mesh_tensors, output_size=cfg['input_resize'], bbox2d=bbox2d_ori[b:b+bs], use_light=True, extra=extra)
     rgb_rs.append(rgb_r)
     depth_rs.append(depth_r[...,None])
+    mask_rs.append(extra['mask'])
     xyz_map_rs.append(extra['xyz_map'])
 
   rgb_rs = torch.cat(rgb_rs, dim=0).permute(0,3,1,2) * 255
   depth_rs = torch.cat(depth_rs, dim=0).permute(0,3,1,2)
+  mask_rs = torch.cat(mask_rs, dim=0).permute(0,3,1,2)
   xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0,3,1,2)  #(B,3,H,W)
   logging.info("render done")
 
@@ -95,6 +98,11 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
     rgbAs = rgb_rs
     depthAs = depth_rs
 
+  if mask_rs.shape[-2:]!=cfg['input_resize']:
+    maskAs = kornia.geometry.transform.warp_perspective(mask_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
+  else:
+    maskAs = mask_rs
+
   if xyz_map_rs.shape[-2:]!=cfg['input_resize']:
     xyz_mapAs = kornia.geometry.transform.warp_perspective(xyz_map_rs, tf_to_crops, dsize=render_size, mode='nearest', align_corners=False)
   else:
@@ -106,7 +114,7 @@ def make_crop_data_batch(render_size, ob_in_cams, mesh, rgb, depth, K, crop_rati
   Ks = torch.as_tensor(K, dtype=torch.float).reshape(1,3,3).expand(len(rgbAs),3,3)
   mesh_diameters = torch.ones((len(rgbAs)), dtype=torch.float, device='cuda')*mesh_diameter
 
-  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=depthAs, depthBs=depthBs, normalAs=normalAs, normalBs=normalBs, poseA=poseAs, xyz_mapAs=xyz_mapAs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
+  pose_data = BatchPoseData(rgbAs=rgbAs, rgbBs=rgbBs, depthAs=depthAs, depthBs=depthBs, normalAs=normalAs, normalBs=normalBs, maskAs=maskAs, maskBs=None, poseA=poseAs, xyz_mapAs=xyz_mapAs, tf_to_crops=tf_to_crops, Ks=Ks, mesh_diameters=mesh_diameters)
   pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W, bound=1)
 
   logging.info("pose batch data done")
@@ -224,4 +232,3 @@ class ScorePredictor:
       return scores, canvas
 
     return scores, None
-

@@ -17,6 +17,34 @@ def _find_function(tree, name):
     raise AssertionError(f"Function {name} not found")
 
 
+def _find_class(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"Class {name} not found")
+
+
+def _class_level_none_assignments(class_node):
+    names = set()
+    for stmt in class_node.body:
+        targets = []
+        value = None
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+            value = stmt.value
+        elif isinstance(stmt, ast.AnnAssign):
+            targets = [stmt.target]
+            value = stmt.value
+
+        if not (isinstance(value, ast.Constant) and value.value is None):
+            continue
+
+        for target in targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
 def _assigned_self_attrs(node):
     attrs = set()
     for child in ast.walk(node):
@@ -226,7 +254,260 @@ def _try_nodes_wrapping_call(node, call_name):
     return matches
 
 
+def _subscript_constant_key(node):
+    if not isinstance(node, ast.Subscript):
+        return None
+    key = node.slice
+    if isinstance(key, ast.Constant):
+        return key.value
+    return None
+
+
+def _assigns_subscript_key(node, target_name, container_name, key):
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == target_name for target in child.targets):
+            continue
+        if (
+            isinstance(child.value, ast.Subscript)
+            and isinstance(child.value.value, ast.Name)
+            and child.value.value.id == container_name
+            and _subscript_constant_key(child.value) == key
+        ):
+            return True
+    return False
+
+
+def _appends_subscript_key(node, list_name, container_name, key):
+    for child in ast.walk(node):
+        if not (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "append"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == list_name
+            and len(child.args) == 1
+        ):
+            continue
+        arg = child.args[0]
+        if (
+            isinstance(arg, ast.Subscript)
+            and isinstance(arg.value, ast.Name)
+            and arg.value.id == container_name
+            and _subscript_constant_key(arg) == key
+        ):
+            return True
+    return False
+
+
+def _name_initialized_to_empty_list(node, name):
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == name for target in child.targets):
+            continue
+        if isinstance(child.value, ast.List) and child.value.elts == []:
+            return True
+    return False
+
+
+def _call_has_keyword(call_node, keyword_name, value_name=None, none_value=False):
+    for keyword in call_node.keywords:
+        if keyword.arg != keyword_name:
+            continue
+        if value_name is not None:
+            return isinstance(keyword.value, ast.Name) and keyword.value.id == value_name
+        if none_value:
+            return isinstance(keyword.value, ast.Constant) and keyword.value.value is None
+        return True
+    return False
+
+
+def _batch_pose_data_calls(node):
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call) and _call_name(child.func) == "BatchPoseData"
+    ]
+
+
+def _assignment_values(node, target_name):
+    values = []
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == target_name for target in child.targets):
+            values.append(child.value)
+    return values
+
+
+def _is_torch_cat_permute_to_nchw(value, source_name):
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "permute"
+    ):
+        return False
+    if [getattr(arg, "value", None) for arg in value.args] != [0, 3, 1, 2]:
+        return False
+    cat_call = value.func.value
+    return (
+        isinstance(cat_call, ast.Call)
+        and _call_name(cat_call.func) == "torch.cat"
+        and len(cat_call.args) >= 1
+        and isinstance(cat_call.args[0], ast.Name)
+        and cat_call.args[0].id == source_name
+    )
+
+
+def _is_flip_dims_one(value):
+    if not (isinstance(value, ast.Call) and _call_name(value.func) == "torch.flip"):
+        return False
+    for keyword in value.keywords:
+        if keyword.arg != "dims":
+            continue
+        return (
+            isinstance(keyword.value, ast.List)
+            and len(keyword.value.elts) == 1
+            and isinstance(keyword.value.elts[0], ast.Constant)
+            and keyword.value.elts[0].value == 1
+        )
+    return False
+
+
+def _is_rast_out_alpha_slice(node):
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "rast_out"
+        and isinstance(node.slice, ast.Tuple)
+        and len(node.slice.elts) == 2
+        and isinstance(node.slice.elts[0], ast.Constant)
+        and node.slice.elts[0].value is Ellipsis
+        and isinstance(node.slice.elts[1], ast.Slice)
+        and isinstance(node.slice.elts[1].lower, ast.UnaryOp)
+        and isinstance(node.slice.elts[1].lower.op, ast.USub)
+        and isinstance(node.slice.elts[1].lower.operand, ast.Constant)
+    ):
+        return False
+    return node.slice.elts[1].lower.operand.value == 1
+
+
+def _function_assigns_mask_from_clamped_alpha(function_node):
+    for child in ast.walk(function_node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "mask" for target in child.targets):
+            continue
+        if not (
+            isinstance(child.value, ast.Call)
+            and _call_name(child.value.func) == "torch.clamp"
+            and len(child.value.args) == 3
+            and _is_rast_out_alpha_slice(child.value.args[0])
+            and isinstance(child.value.args[1], ast.Constant)
+            and child.value.args[1].value == 0
+            and isinstance(child.value.args[2], ast.Constant)
+            and child.value.args[2].value == 1
+        ):
+            continue
+        return True
+    return False
+
+
+def _function_assigns_extra_mask_with_flipped_mask(function_node):
+    for child in ast.walk(function_node):
+        if not isinstance(child, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Subscript)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "extra"
+            and _subscript_constant_key(target) == "mask"
+            for target in child.targets
+        ):
+            continue
+        if _is_flip_dims_one(child.value):
+            return True
+    return False
+
+
+def _has_mask_warp_branch(function_node):
+    for child in ast.walk(function_node):
+        if not isinstance(child, ast.If):
+            continue
+        if not (
+            isinstance(child.test, ast.Compare)
+            and isinstance(child.test.left, ast.Subscript)
+            and isinstance(child.test.left.value, ast.Attribute)
+            and isinstance(child.test.left.value.value, ast.Name)
+            and child.test.left.value.value.id == "mask_rs"
+            and child.test.left.value.attr == "shape"
+            and isinstance(child.test.ops[0], ast.NotEq)
+        ):
+            continue
+        body_text = ast.unparse(ast.Module(body=child.body, type_ignores=[]))
+        orelse_text = ast.unparse(ast.Module(body=child.orelse, type_ignores=[]))
+        if (
+            "kornia.geometry.transform.warp_perspective" in body_text
+            and "mode='nearest'" in body_text
+            and "maskAs = mask_rs" in orelse_text
+        ):
+            return True
+    return False
+
+
+def _crop_builder_collects_and_passes_mask(path):
+    tree = _parse(path)
+    make_crop_data_batch = _find_function(tree, "make_crop_data_batch")
+
+    self = unittest.TestCase()
+    self.assertTrue(_name_initialized_to_empty_list(make_crop_data_batch, "mask_rs"))
+    self.assertTrue(_appends_subscript_key(make_crop_data_batch, "mask_rs", "extra", "mask"))
+    self.assertTrue(
+        any(
+            _is_torch_cat_permute_to_nchw(value, "mask_rs")
+            for value in _assignment_values(make_crop_data_batch, "mask_rs")
+        )
+    )
+    self.assertTrue(_has_mask_warp_branch(make_crop_data_batch))
+
+    batch_calls = _batch_pose_data_calls(make_crop_data_batch)
+    self.assertTrue(batch_calls, "make_crop_data_batch should construct BatchPoseData")
+    self.assertTrue(any(_call_has_keyword(call, "maskAs", value_name="maskAs") for call in batch_calls))
+    self.assertTrue(any(_call_has_keyword(call, "maskBs", none_value=True) for call in batch_calls))
+
+
 class FoundationPoseReuseStaticTests(unittest.TestCase):
+    def test_batch_pose_data_exposes_batch_masks(self):
+        tree = _parse("learning/datasets/pose_dataset.py")
+        batch_pose_data = _find_class(tree, "BatchPoseData")
+
+        self.assertTrue(
+            {"maskAs", "maskBs"}.issubset(_class_level_none_assignments(batch_pose_data))
+        )
+
+    def test_batch_pose_data_select_by_indices_indexes_all_present_tensors(self):
+        tree = _parse("learning/datasets/pose_dataset.py")
+        select_by_indices = _find_function(tree, "select_by_indices")
+
+        self.assertIn("self.__dict__", ast.unparse(select_by_indices))
+        self.assertIn("out.__dict__[k]", ast.unparse(select_by_indices))
+        self.assertIn("ids.to", _calls_under(select_by_indices))
+
+    def test_nvdiffrast_render_exports_flipped_silhouette_mask(self):
+        tree = _parse("Utils.py")
+        nvdiffrast_render = _find_function(tree, "nvdiffrast_render")
+
+        self.assertTrue(_function_assigns_mask_from_clamped_alpha(nvdiffrast_render))
+        self.assertTrue(_function_assigns_extra_mask_with_flipped_mask(nvdiffrast_render))
+
+    def test_score_crop_builder_collects_render_mask_as_batch_maskA(self):
+        _crop_builder_collects_and_passes_mask("learning/training/predict_score.py")
+
+    def test_refine_crop_builder_collects_render_mask_as_batch_maskA(self):
+        _crop_builder_collects_and_passes_mask("learning/training/predict_pose_refine.py")
+
     def test_reset_object_clears_per_object_tracking_state(self):
         tree = _parse("estimater.py")
         reset_object = _find_function(tree, "reset_object")

@@ -258,9 +258,11 @@ def nvdiffrast_render(K=None, H=None, W=None, ob_in_cams=None, glctx=None, conte
     color = color*w_ambient + diffuse_intensity_map*light_color*w_diffuse
 
   color = color.clip(0,1)
-  color = color * torch.clamp(rast_out[..., -1:], 0, 1) # Mask out background using alpha
+  mask = torch.clamp(rast_out[..., -1:], 0, 1)
+  color = color * mask # Mask out background using alpha
   color = torch.flip(color, dims=[1])   # Flip Y coordinates
   depth = torch.flip(depth, dims=[1])
+  extra['mask'] = torch.flip(mask, dims=[1])
   extra['xyz_map'] = torch.flip(xyz_map, dims=[1])
   return color, depth, normal_map
 

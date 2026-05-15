@@ -81,6 +81,8 @@ class BatchPoseData:
     rgbBs = None
     depthAs = None
     depthBs = None
+    maskAs = None
+    maskBs = None
     normalAs = None
     normalBs = None
     poseA = None  #(B,4,4)
@@ -132,4 +134,3 @@ class BatchPoseData:
         if self.__dict__[k] is not None:
           out.__dict__[k] = self.__dict__[k][ids.to(self.__dict__[k].device)]
       return out
-
