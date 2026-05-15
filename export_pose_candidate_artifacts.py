@@ -1,13 +1,12 @@
-import os
 import io
 import logging
+import os
 import traceback
 from pathlib import Path
 
-import numpy as np
 import imageio.v3 as iio
+import numpy as np
 import trimesh
-import pickle
 
 from estimater import *
 from datareader import *
@@ -18,6 +17,41 @@ def configure_quiet_logging():
     logging.getLogger().setLevel(logging.ERROR)
     for handler in logging.getLogger().handlers:
         handler.setLevel(logging.ERROR)
+
+
+def tensor_to_numpy(value):
+    if hasattr(value, "detach"):
+        value = value.detach()
+    elif hasattr(value, "data"):
+        value = value.data
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def pose_data_to_artifacts(pose_data):
+    render_rgbs = tensor_to_numpy(pose_data.rgbAs)
+    render_rgbs = np.moveaxis(render_rgbs, 1, -1)
+    render_rgbs = np.clip(render_rgbs * 255.0, 0, 255).astype(np.uint8)
+
+    render_masks = tensor_to_numpy(pose_data.maskAs)
+    if render_masks.ndim == 4 and render_masks.shape[1] == 1:
+        render_masks = render_masks[:, 0]
+    render_masks = (render_masks > 0.5).astype(np.uint8)
+
+    tf_to_crops = tensor_to_numpy(pose_data.tf_to_crops)
+
+    return {
+        "render_rgbs": render_rgbs,
+        "render_masks": render_masks,
+        "tf_to_crops": tf_to_crops,
+    }
+
+
+def artifact_key(frame_idx, name):
+    return f"{name}_{frame_idx:04d}"
 
 
 def main():
@@ -44,11 +78,12 @@ def main():
             for object_dir in object_dirs:
                 masks_path = object_dir / "masks.npz"
                 mesh_path = object_dir / "mesh.glb"
-                
-                save_path = object_dir / "all_poses&scores.pkl"
+
+                save_path = object_dir / "all_pose_candidates_artifacts.npz"
+                tmp_save_path = object_dir / "all_pose_candidates_artifacts.tmp.npz"
                 if save_path.exists():
                     continue
-                    
+
                 intrinsics = np.load(intrinsics_path)
                 intrinsics = intrinsics.astype(np.float64)
 
@@ -63,8 +98,6 @@ def main():
                 masks = masks["masks_visible"]
 
                 mesh = trimesh.load(mesh_path, force="mesh")
-                # to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-                # bbox = np.stack([-extents/2, extents/2], axis=0).reshape(2,3)
 
                 if est is None:
                     scorer = ScorePredictor()
@@ -88,31 +121,39 @@ def main():
                     )
 
                 T = images.shape[0]
-                all_poses = []
-                all_scores = []
+                valid = np.zeros(T, dtype=bool)
+                result = {"valid": valid}
                 for frame_idx in range(T):
-                    poses, scores = est.register_all(
+                    register_result = est.register_all(
                         K=intrinsics,
                         rgb=images[frame_idx],
                         depth=depths[frame_idx],
                         ob_mask=masks[frame_idx],
                         iteration=5,
+                        return_pose_data=True,
                     )
-                    all_poses.append(poses)
-                    all_scores.append(scores)
+                    if register_result is None:
+                        valid[frame_idx] = False
+                        continue
 
-                result = {}
-                result["poses"] = all_poses
-                result["scores"] = all_scores
-                
-                with open(save_path, "wb") as f:
-                    pickle.dump(result, f)
-        
-        except Exception as e:
+                    poses, scores, pose_data = register_result
+                    artifacts = pose_data_to_artifacts(pose_data)
+                    valid[frame_idx] = True
+                    result[artifact_key(frame_idx, "poses")] = poses
+                    result[artifact_key(frame_idx, "scores")] = scores
+                    result[artifact_key(frame_idx, "render_rgbs")] = artifacts["render_rgbs"]
+                    result[artifact_key(frame_idx, "render_masks")] = artifacts["render_masks"]
+                    result[artifact_key(frame_idx, "tf_to_crops")] = artifacts["tf_to_crops"]
+
+                np.savez_compressed(tmp_save_path, **result)
+                tmp_save_path.replace(save_path)
+
+        except Exception:
             tqdm.write(f"Failed to process {seq_dir.relative_to(data_root)}")
             io_string = io.StringIO()
             traceback.print_exc(file=io_string)
             tqdm.write(io_string.getvalue())
+
 
 if __name__ == "__main__":
     main()

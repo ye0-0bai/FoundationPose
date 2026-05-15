@@ -544,7 +544,7 @@ class FoundationPoseReuseStaticTests(unittest.TestCase):
         self.assertIn("est.reset_object", reuse_calls)
 
     def test_pose_candidate_script_uses_lazy_first_object_foundationpose(self):
-        tree = _parse("get_all_pose_candidates_and_scores.py")
+        tree = _parse("export_pose_candidate_artifacts.py")
         main = _find_function(tree, "main")
         self.assertTrue(_assigns_name_to_none(main, "est"))
 

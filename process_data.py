@@ -308,13 +308,18 @@ def main():
             all_poses = []
             all_scores = []
             for frame_idx in range(T):
-                poses, scores = est.register_all(
+                register_result = est.register_all(
                     K=intrinsics,
                     rgb=images[frame_idx],
                     depth=depths[frame_idx],
                     ob_mask=masks[frame_idx],
                     iteration=5,
                 )
+                if register_result is None:
+                    all_poses.append(np.empty((0, 4, 4), dtype=np.float64))
+                    all_scores.append(np.empty((0,), dtype=np.float64))
+                    continue
+                poses, scores = register_result
                 all_poses.append(poses)
                 all_scores.append(scores)
 

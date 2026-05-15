@@ -166,7 +166,7 @@ class ScorePredictor:
 
 
   @torch.inference_mode()
-  def predict(self, rgb, depth, K, ob_in_cams, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None):
+  def predict(self, rgb, depth, K, ob_in_cams, normal_map=None, get_vis=False, mesh=None, mesh_tensors=None, glctx=None, mesh_diameter=None, return_pose_data=False):
     '''
     @rgb: np array (H,W,3)
     '''
@@ -229,6 +229,11 @@ class ScorePredictor:
       canvas = []
       ids = scores.argsort(descending=True)
       canvas = vis_batch_data_scores(pose_data, ids=ids, scores=scores)
+      if return_pose_data:
+        return scores, canvas, pose_data
       return scores, canvas
+
+    if return_pose_data:
+      return scores, None, pose_data
 
     return scores, None

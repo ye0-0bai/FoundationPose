@@ -263,7 +263,7 @@ class FoundationPose:
     return best_pose.data.cpu().numpy()
 
 
-  def register_all(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5):
+  def register_all(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, return_pose_data=False):
     '''Copmute poses from given pts to self.pcd, returning all poses with scores
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -291,9 +291,7 @@ class FoundationPose:
     valid = (depth>=0.001) & (ob_mask>0)
     if valid.sum()<4:
       logging.info(f'valid too small, return')
-      pose = np.eye(4)
-      pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
-      return pose[np.newaxis], np.array([np.nan])
+      return None
 
     if self.debug>=2:
       imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
@@ -323,7 +321,12 @@ class FoundationPose:
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
-    scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
+    score_result = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2, return_pose_data=return_pose_data)
+    if return_pose_data:
+      scores, vis, pose_data = score_result
+    else:
+      scores, vis = score_result
+      pose_data = None
     if vis is not None:
       imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
 
@@ -334,6 +337,8 @@ class FoundationPose:
     logging.info(f'sort ids:{ids}')
     scores = scores[ids]
     poses = poses[ids]
+    if pose_data is not None:
+      pose_data = pose_data.select_by_indices(ids)
 
     logging.info(f'sorted scores:{scores}')
 
@@ -343,6 +348,9 @@ class FoundationPose:
 
     self.poses = poses
     self.scores = scores
+
+    if return_pose_data:
+      return poses_out.data.cpu().numpy(), scores.data.cpu().numpy(), pose_data
 
     return poses_out.data.cpu().numpy(), scores.data.cpu().numpy()
 
