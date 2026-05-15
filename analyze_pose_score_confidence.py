@@ -1,4 +1,34 @@
-"""Analyze per-frame pose candidate score distributions as confidence signals."""
+"""Analyze pose candidate score distributions as confidence signals.
+
+Purpose:
+    FoundationPose can save multiple pose candidates and their scores for each
+    frame in ``all_poses&scores.pkl``. This script checks whether the score
+    distribution itself is useful as a confidence signal for the selected pose,
+    without rerunning pose estimation or requiring ground-truth poses.
+
+What it does:
+    For every processed object directory under ``--data-root``, the script loads
+    per-frame candidate scores, filters non-finite values, sorts finite scores
+    from high to low, and computes raw score diagnostics, score margins,
+    softmax probability metrics, entropy metrics, and effective candidate
+    counts. It writes dataset-level CSV summaries under the repository
+    ``debug/`` directory and saves per-object plots under each
+    ``<object_dir>/debug/`` directory. Raw per-frame score histograms are
+    available with ``--save-score-histograms`` but are disabled by default to
+    avoid generating many images.
+
+How to use:
+    Run from the repository root, for example:
+
+        python analyze_pose_score_confidence.py \
+            --data-root /data/datasets/DexYCB/processed \
+            --temperature 1.0 \
+            --overwrite
+
+    Main outputs are ``debug/score_confidence_by_frame.csv`` and
+    ``debug/score_confidence_by_object.csv``. Per-object visualizations are
+    ``score_confidence_curves.png`` and ``score_confidence_distributions.png``.
+"""
 
 import argparse
 import csv
