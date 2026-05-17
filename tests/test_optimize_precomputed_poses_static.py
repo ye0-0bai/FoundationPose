@@ -211,6 +211,35 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         _find_function(tree, "write_experiment_record")
         _find_function(tree, "generate_run_id")
 
+    def test_main_writes_running_record_before_processing_loop(self):
+        tree = _parse("optimize_precomputed_poses.py")
+        main = _find_function(tree, "main")
+        seq_loop = _for_loop_by_target(main, "seq_dir")
+        running_record_calls = []
+
+        for node in ast.walk(main):
+            if not (
+                isinstance(node, ast.Call)
+                and _call_name(node.func) == "write_experiment_record"
+            ):
+                continue
+            if any(
+                keyword.arg == "run_status"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "running"
+                for keyword in node.keywords
+            ):
+                running_record_calls.append(node)
+
+        self.assertTrue(running_record_calls)
+        self.assertLess(running_record_calls[0].lineno, seq_loop.lineno)
+
+    def test_main_writes_running_and_completed_record_statuses(self):
+        source = (ROOT / "optimize_precomputed_poses.py").read_text()
+
+        self.assertIn('run_status="running"', source)
+        self.assertIn('run_status="completed"', source)
+
     def test_gitignore_allows_exp_tracking(self):
         gitignore = (ROOT / ".gitignore").read_text()
 

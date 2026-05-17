@@ -206,12 +206,21 @@ def output_naming_for_run(run_id):
     }
 
 
-def write_experiment_record(repo_root, run_id, generated_at, argv, args, stats):
+def write_experiment_record(
+    repo_root,
+    run_id,
+    generated_at,
+    argv,
+    args,
+    stats,
+    run_status="completed",
+):
     """Write a Markdown experiment record with an embedded JSON config block."""
     record_path = experiment_record_path(repo_root, run_id)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
+        "run_status": run_status,
         "generated_at": generated_at,
         "argv": list(argv),
         "data_root": str(args.data_root),
@@ -1030,6 +1039,16 @@ def main():
         "skipped_missing_masks": 0,
         "failed": 0,
     }
+    record_path = write_experiment_record(
+        Path(__file__).resolve().parent,
+        run_id=run_id,
+        generated_at=generated_at,
+        argv=sys.argv,
+        args=args,
+        stats=stats,
+        run_status="running",
+    )
+    tqdm.tqdm.write(f"Experiment record: {record_path}")
 
     for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
         try:
@@ -1056,6 +1075,7 @@ def main():
         argv=sys.argv,
         args=args,
         stats=stats,
+        run_status="completed",
     )
 
 

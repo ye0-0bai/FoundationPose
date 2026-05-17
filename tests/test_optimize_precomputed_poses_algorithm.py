@@ -237,6 +237,49 @@ class OptimizePrecomputedPosesAlgorithmTests(unittest.TestCase):
             self.assertEqual(data["output_naming"]["poses"], "poses_optimized_test123.npy")
             self.assertEqual(data["output_naming"]["debug"], "poses_optimized_test123_debug.npz")
             self.assertTrue(data["debug_enabled"])
+            self.assertEqual(data["run_status"], "completed")
+            self.assertEqual(data["processing_stats"], stats)
+
+    def test_write_experiment_record_accepts_running_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            stats = {
+                "processed": 0,
+                "skipped_existing": 0,
+                "skipped_missing_artifacts": 0,
+                "skipped_missing_masks": 0,
+                "failed": 0,
+            }
+            args = Namespace(
+                data_root="/data/example",
+                overwrite=False,
+                max_invalid_gap=5,
+                smooth_window=7,
+                smooth_polyorder=2,
+                trans_lambda=0.25,
+                rot_lambda=0.5,
+                run_id="test123",
+                debug=False,
+            )
+
+            record_path = write_experiment_record(
+                root,
+                run_id="test123",
+                generated_at="2026-05-18T12:34:56+08:00",
+                argv=["optimize_precomputed_poses.py", "--run-id", "test123"],
+                args=args,
+                stats=stats,
+                run_status="running",
+            )
+
+            text = record_path.read_text()
+            payload = text.split("```json", 1)[1].split("```", 1)[0].strip()
+            data = json.loads(payload)
+            self.assertEqual(data["run_status"], "running")
+            self.assertEqual(data["run_id"], "test123")
+            self.assertEqual(data["data_root"], "/data/example")
+            self.assertEqual(data["output_naming"]["poses"], "poses_optimized_test123.npy")
+            self.assertEqual(data["optimization_parameters"]["trans_lambda"], 0.25)
             self.assertEqual(data["processing_stats"], stats)
 
     def test_smooth_pose_trajectory_interpolates_short_gaps_and_preserves_long_gaps(self):
