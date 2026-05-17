@@ -1,48 +1,32 @@
-"""Optimize precomputed pose candidates for processed DexYCB objects.
+"""Optimize artifact pose candidates with IoU-weighted confidence.
 
-当前优化逻辑说明:
+The optimizer consumes ``all_pose_candidates_artifacts.npz`` plus each
+object's ``masks.npz`` visible masks. For every valid frame it min-max
+normalizes candidate scores, warps the full-frame visible mask into each
+FoundationPose crop with the exported ``tf_to_crops`` transform, computes IoU
+against the rendered candidate mask, and scores candidates as
+``minmax(score) * mask_iou``.
 
-本脚本不重新估计单帧 pose，而是在预计算得到的每帧候选 pose 集合
-``all_poses&scores.pkl`` 上做后处理优化。整体流程分为两级:
+Dynamic programming then selects one globally consistent candidate trajectory,
+penalizing translation and rotation jumps between adjacent valid frames. Short
+invalid gaps may be interpolated and contiguous valid runs are smoothed with
+Savitzky-Golay filtering. Missing artifact or visible-mask files are reported
+and skipped without using any alternate input source.
 
-1. 轨迹选择:
-   - 对每一帧保留有限且数值有效的候选 pose 与 score。
-   - 将单帧 score 归一化为 log-probability，作为候选本身的置信度项。
-   - 使用动态规划从所有有效帧中选择一条全局最优候选轨迹，而不是逐帧
-     贪心选择最高分候选。
-   - 相邻帧转移代价由两部分组成:
-       translation_cost = ||t_cur - t_prev|| / mesh_diameter
-       rotation_cost = angle(R_prev, R_cur) / pi
-     其中 mesh_diameter 用于把不同尺寸物体的平移跳变归一到可比较尺度。
-   - 当前目标相当于最大化:
-       sum(normalized_score)
-       - trans_lambda * sum(translation_cost)
-       - rot_lambda * sum(rotation_cost)
-     因此 trans_lambda 与 rot_lambda 越大，轨迹越偏向时间连续；越小，越
-     偏向逐帧候选分数。
-   - 没有有效候选的帧不参与动态规划，输出轨迹中这些帧先保留为全零 pose。
-
-2. 轨迹后处理:
-   - 仅对长度不超过 max_invalid_gap 的无效短缺口做插值: 平移线性插值，
-     旋转使用 Slerp。
-   - 对连续有效片段做 Savitzky-Golay 平滑: 平移直接平滑，旋转先转为四元数
-     并处理符号连续性后再平滑和归一化。
-   - 超过 max_invalid_gap 的长缺失区间仍保持全零 pose，避免在缺少可靠候选
-     的区域生成过度猜测的轨迹。
-
-脚本最终保存 ``poses_optimized.npy`` 供下游使用，并渲染
-``poses_optimized.mp4`` 作为人工检查当前优化方案效果的可视化结果。
+Outputs are written separately as ``poses_optimized_iou.npy`` and
+``poses_optimized_iou.mp4`` so older optimization products are left untouched.
 """
 
 import argparse
 import io
-import pickle
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 import imageio.v3 as iio
+import kornia
 import numpy as np
+import torch
 import tqdm
 import trimesh
 from scipy.signal import savgol_filter
@@ -53,9 +37,10 @@ from process_data import configure_quiet_logging
 
 
 DEFAULT_DATA_ROOT = "/data/datasets/DexYCB/processed"
-CANDIDATES_FILENAME = "all_poses&scores.pkl"
-POSES_FILENAME = "poses_optimized.npy"
-VIDEO_FILENAME = "poses_optimized.mp4"
+ARTIFACTS_FILENAME = "all_pose_candidates_artifacts.npz"
+MASKS_FILENAME = "masks.npz"
+POSES_FILENAME = "poses_optimized_iou.npy"
+VIDEO_FILENAME = "poses_optimized_iou.mp4"
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +64,8 @@ class ObjectPaths:
 
     object_dir: Path
     mesh: Path
-    candidates: Path
+    artifacts: Path
+    masks: Path
     optimized_poses: Path
     optimized_video: Path
 
@@ -89,7 +75,8 @@ class ObjectPaths:
         return cls(
             object_dir=object_dir,
             mesh=object_dir / "mesh.glb",
-            candidates=object_dir / CANDIDATES_FILENAME,
+            artifacts=object_dir / ARTIFACTS_FILENAME,
+            masks=object_dir / MASKS_FILENAME,
             optimized_poses=object_dir / POSES_FILENAME,
             optimized_video=object_dir / VIDEO_FILENAME,
         )
@@ -117,7 +104,7 @@ def parse_args():
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Regenerate optimized outputs even when poses_optimized.npy already exists.",
+        help="Regenerate optimized outputs even when poses_optimized_iou.npy already exists.",
     )
     # The smoothing options are forwarded to smooth_pose_trajectory(), which
     # fills short invalid gaps before applying Savitzky-Golay filtering.
@@ -175,61 +162,172 @@ def ensure_optimization_config(config_or_args):
 
 
 # ---------------------------------------------------------------------------
-# Candidate data loading and validation
+# Artifact data loading, validation, and IoU weighting
 
 
-def load_pose_candidates(candidates_path):
-    """Load pose candidates and confidence scores from a pickle file.
-
-    Args:
-        candidates_path (Path): Path to ``all_poses&scores.pkl``.
-
-    Returns:
-        tuple: A pair ``(poses, scores)`` where each item contains per-frame
-        pose candidates and their corresponding scores.
-
-    Raises:
-        KeyError: If the pickle file does not contain ``poses`` and ``scores``.
-    """
-    # Candidate files are produced by the precomputation stage and are expected
-    # to be dictionaries with parallel per-frame pose and score lists.
-    with open(candidates_path, "rb") as f:
-        candidates = pickle.load(f)
-
-    # Fail early if the file format is wrong; downstream trajectory selection
-    # assumes both keys exist and are aligned frame by frame.
-    if "poses" not in candidates or "scores" not in candidates:
-        raise KeyError(f"{candidates_path} must contain 'poses' and 'scores'")
-    return candidates["poses"], candidates["scores"]
+def artifact_key(frame_idx, name):
+    """Return the zero-padded per-frame artifact key used by the NPZ export."""
+    return f"{name}_{frame_idx:04d}"
 
 
-def normalize_scores(scores, temperature=1.0):
-    """Convert raw candidate scores into comparable log-probabilities.
+def normalize_scores(scores, method="minmax"):
+    """Scale raw candidate scores while preserving invalid entries.
 
     Args:
         scores (array-like): One frame's candidate confidence scores.
-        temperature (float): Optional softmax temperature applied before
-            normalization.
+        method (str): Normalization method. Only ``"minmax"`` is supported.
 
     Returns:
-        np.ndarray: Score array with the same shape, where finite entries are
-        normalized log-probabilities.
+        np.ndarray: Score array with the same shape. Finite entries are scaled
+        into ``[0, 1]``; non-finite entries remain non-finite.
     """
+    if method != "minmax":
+        raise ValueError(f"unsupported score normalization method: {method}")
+
     scores = np.asarray(scores, dtype=np.float64).reshape(-1)
     finite = np.isfinite(scores)
-
-    # Invalid scores are kept at a very low value so accidental reuse is still
-    # dominated by any finite candidate after filtering.
-    normalized = np.full_like(scores, -1e6, dtype=np.float64)
+    normalized = np.full_like(scores, np.nan, dtype=np.float64)
     if not finite.any():
-        return np.zeros_like(scores, dtype=np.float64)
+        return normalized
 
-    x = scores[finite] / temperature
-    x = x - x.max()
-    log_probs = x - np.log(np.exp(x).sum())
-
-    normalized[finite] = log_probs
+    finite_scores = scores[finite]
+    score_min = finite_scores.min()
+    score_max = finite_scores.max()
+    if np.isclose(score_max, score_min):
+        normalized[finite] = 1.0
+    else:
+        normalized[finite] = (finite_scores - score_min) / (score_max - score_min)
     return normalized
+
+
+def validate_frame_artifacts(artifacts, frame_idx):
+    """Load and validate one frame's pose, score, mask, and crop artifacts."""
+    poses_key = artifact_key(frame_idx, "poses")
+    scores_key = artifact_key(frame_idx, "scores")
+    render_masks_key = artifact_key(frame_idx, "render_masks")
+    tf_to_crops_key = artifact_key(frame_idx, "tf_to_crops")
+    for key in [poses_key, scores_key, render_masks_key, tf_to_crops_key]:
+        if key not in artifacts:
+            raise KeyError(f"artifact is missing required key: {key}")
+
+    poses = np.asarray(artifacts[poses_key], dtype=np.float64).reshape(-1, 4, 4)
+    scores = np.asarray(artifacts[scores_key], dtype=np.float64).reshape(-1)
+    render_masks = np.asarray(artifacts[render_masks_key])
+    tf_to_crops = np.asarray(artifacts[tf_to_crops_key], dtype=np.float32).reshape(-1, 3, 3)
+
+    if render_masks.ndim != 3:
+        raise ValueError(f"{render_masks_key} must have shape (N, H, W)")
+    candidate_count = len(poses)
+    if not (
+        len(scores) == candidate_count
+        and len(render_masks) == candidate_count
+        and len(tf_to_crops) == candidate_count
+    ):
+        raise ValueError(f"frame {frame_idx} artifact candidate counts do not match")
+    return poses, scores, render_masks, tf_to_crops
+
+
+def load_pose_candidate_artifacts(artifacts_path):
+    """Load validated pose candidate artifacts from an NPZ file."""
+    with np.load(artifacts_path) as data:
+        artifacts = {key: data[key] for key in data.files}
+
+    if "valid" not in artifacts:
+        raise KeyError(f"{artifacts_path} must contain 'valid'")
+    valid = np.asarray(artifacts["valid"], dtype=bool).reshape(-1)
+    artifacts["valid"] = valid
+    for frame_idx, is_valid in enumerate(valid):
+        if is_valid:
+            validate_frame_artifacts(artifacts, frame_idx)
+    return artifacts
+
+
+def load_visible_masks(masks_path):
+    """Load full-frame visible masks used for crop-space IoU confidence."""
+    with np.load(masks_path) as data:
+        if "masks_visible" not in data:
+            raise KeyError(f"{masks_path} must contain 'masks_visible'")
+        masks_visible = np.asarray(data["masks_visible"])
+    if masks_visible.ndim != 3:
+        raise ValueError("masks_visible must have shape (T, H, W)")
+    return masks_visible
+
+
+def compute_mask_ious(visible_mask, render_masks, tf_to_crops):
+    """Compute crop-space IoU between visible and rendered candidate masks."""
+    render_masks = np.asarray(render_masks)
+    if render_masks.ndim != 3:
+        raise ValueError("render_masks must have shape (N, H, W)")
+    tf_to_crops = np.asarray(tf_to_crops, dtype=np.float32).reshape(-1, 3, 3)
+    if len(render_masks) != len(tf_to_crops):
+        raise ValueError("render_masks and tf_to_crops must have matching counts")
+    if len(render_masks) == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    visible_mask = np.asarray(visible_mask, dtype=np.float32)
+    if visible_mask.ndim != 2:
+        raise ValueError("visible_mask must have shape (H, W)")
+
+    crop_h, crop_w = render_masks.shape[-2:]
+    batch_size = len(render_masks)
+    visible_tensor = torch.as_tensor(visible_mask, dtype=torch.float32)[None, None]
+    visible_tensor = visible_tensor.expand(batch_size, -1, -1, -1)
+    tf_tensor = torch.as_tensor(tf_to_crops, dtype=torch.float32)
+    cropped_visible = kornia.geometry.transform.warp_perspective(
+        visible_tensor,
+        tf_tensor,
+        dsize=(crop_h, crop_w),
+        mode="nearest",
+        align_corners=False,
+    )
+    visible_np = cropped_visible[:, 0].detach().cpu().numpy() > 0.5
+    render_np = render_masks > 0.5
+
+    intersection = np.logical_and(visible_np, render_np).sum(axis=(1, 2))
+    union = np.logical_or(visible_np, render_np).sum(axis=(1, 2))
+    return np.divide(
+        intersection,
+        union,
+        out=np.zeros(batch_size, dtype=np.float64),
+        where=union > 0,
+    )
+
+
+def prepare_iou_weighted_candidates(artifacts, masks_visible):
+    """Build per-frame pose candidates scored by min-max score times mask IoU."""
+    if "valid" not in artifacts:
+        raise KeyError("artifacts must contain 'valid'")
+
+    valid = np.asarray(artifacts["valid"], dtype=bool).reshape(-1)
+    masks_visible = np.asarray(masks_visible)
+    if len(masks_visible) < len(valid):
+        raise ValueError("masks_visible has fewer frames than artifacts")
+
+    all_poses = []
+    all_scores = []
+    for frame_idx, is_valid in enumerate(valid):
+        if not is_valid:
+            all_poses.append(np.empty((0, 4, 4), dtype=np.float64))
+            all_scores.append(np.empty((0,), dtype=np.float64))
+            continue
+
+        poses, scores, render_masks, tf_to_crops = validate_frame_artifacts(
+            artifacts,
+            frame_idx,
+        )
+        normalized_scores = normalize_scores(scores, method="minmax")
+        ious = compute_mask_ious(
+            masks_visible[frame_idx],
+            render_masks,
+            tf_to_crops,
+        )
+        finite = np.isfinite(normalized_scores) & np.isfinite(ious)
+        adjusted_scores = np.full_like(normalized_scores, np.nan, dtype=np.float64)
+        adjusted_scores[finite] = normalized_scores[finite] * ious[finite]
+
+        all_poses.append(poses)
+        all_scores.append(adjusted_scores)
+    return all_poses, all_scores
 
 
 def finite_candidate_mask(poses, scores):
@@ -240,7 +338,7 @@ def finite_candidate_mask(poses, scores):
     return finite
 
 
-def clean_pose_candidates(all_poses, all_scores):
+def filter_pose_candidates(all_poses, all_scores):
     """Filter invalid candidates and collect frame indices used by DP."""
     if len(all_poses) != len(all_scores):
         raise ValueError("all_poses and all_scores must have the same number of frames")
@@ -259,7 +357,7 @@ def clean_pose_candidates(all_poses, all_scores):
             continue
 
         poses_per_frame.append(poses[finite])
-        scores_per_frame.append(normalize_scores(scores[finite]))
+        scores_per_frame.append(scores[finite])
         valid_frame_indices.append(frame_idx)
 
     return poses_per_frame, scores_per_frame, valid_frame_indices
@@ -448,7 +546,7 @@ def select_pose_trajectory(
     if len(all_poses) == 0:
         return np.empty((0, 4, 4), dtype=np.float64)
 
-    poses_per_frame, scores_per_frame, valid_frame_indices = clean_pose_candidates(
+    poses_per_frame, scores_per_frame, valid_frame_indices = filter_pose_candidates(
         all_poses,
         all_scores,
     )
@@ -548,13 +646,13 @@ def smooth_pose_trajectory(
 
 
 def optimize_pose_candidates(all_poses, all_scores, mesh, config):
-    """Select and smooth the best pose trajectory for one object.
+    """Select and smooth the best IoU-weighted pose trajectory for one object.
 
     Args:
         all_poses (Sequence[np.ndarray]): Per-frame candidate poses with shape
             ``(N, 4, 4)`` for each frame.
-        all_scores (Sequence[np.ndarray]): Per-frame candidate scores aligned
-            with ``all_poses``.
+        all_scores (Sequence[np.ndarray]): Per-frame IoU-weighted scores
+            aligned with ``all_poses``.
         mesh (trimesh.Trimesh): Object mesh used to normalize translation
             transition costs.
         config (OptimizationConfig | argparse.Namespace): Optimization and
@@ -565,14 +663,12 @@ def optimize_pose_candidates(all_poses, all_scores, mesh, config):
         np.ndarray: Optimized pose trajectory with shape ``(T, 4, 4)``.
     """
     config = ensure_optimization_config(config)
-    # The mesh diameter puts translation jumps on a scale comparable across
-    # objects, so large and small meshes can use the same penalty weights.
+    # The mesh diameter puts translation jumps on a comparable scale across
+    # objects, so one penalty setting can be reused dataset-wide.
     mesh_diameter = compute_mesh_diameter(
         model_pts=np.asarray(mesh.vertices),
         n_sample=10000,
     )
-    # First select one candidate per valid frame using score and transition
-    # costs, leaving invalid frames as all-zero poses.
     trajectory = select_pose_trajectory(
         all_poses,
         all_scores,
@@ -580,8 +676,6 @@ def optimize_pose_candidates(all_poses, all_scores, mesh, config):
         trans_lambda=config.trans_lambda,
         rot_lambda=config.rot_lambda,
     )
-    # Then interpolate only short invalid gaps and smooth continuous valid
-    # segments; long missing regions remain invalid to avoid hallucinated poses.
     return smooth_pose_trajectory(
         trajectory,
         max_invalid_gap=config.max_invalid_gap,
@@ -662,42 +756,46 @@ def render_optimized_poses(seq_dir, object_paths, mesh, trajectory):
 
 
 def process_object(seq_dir, object_dir, args):
-    """Optimize and render precomputed pose candidates for one object.
+    """Optimize and render artifact pose candidates for one object.
 
     Args:
         seq_dir (Path): Sequence directory containing RGB frames and camera
             intrinsics.
-        object_dir (Path): Directory containing object mesh and precomputed
-            pose candidates.
+        object_dir (Path): Directory containing mesh, artifacts, and masks.
         args (argparse.Namespace): Command-line arguments controlling the
             optimization run.
 
     Returns:
         str: Processing status. One of ``skipped_existing``,
-        ``skipped_missing_candidates``, or ``processed``.
+        ``skipped_missing_artifacts``, ``skipped_missing_masks``, or
+        ``processed``.
     """
     object_paths = ObjectPaths.from_object_dir(object_dir)
 
-    # Skip completed objects unless the caller explicitly requests regeneration.
     save_path = object_paths.optimized_poses
     if not args.overwrite and save_path.exists():
         return "skipped_existing"
 
-    # Some object directories may not have candidate files, especially during
-    # interrupted preprocessing runs; report and continue with other objects.
-    candidates_path = object_paths.candidates
-    if not candidates_path.exists():
-        tqdm.tqdm.write(f"Missing {candidates_path}; skipping")
-        return "skipped_missing_candidates"
+    artifacts_path = object_paths.artifacts
+    if not artifacts_path.exists():
+        tqdm.tqdm.write(f"Missing {artifacts_path}; skipping")
+        return "skipped_missing_artifacts"
 
-    # Load all object-specific inputs before running the optimization pipeline.
+    masks_path = object_paths.masks
+    if not masks_path.exists():
+        tqdm.tqdm.write(f"Missing {masks_path}; skipping")
+        return "skipped_missing_masks"
+
     config = ensure_optimization_config(args)
-    all_poses, all_scores = load_pose_candidates(candidates_path)
+    artifacts = load_pose_candidate_artifacts(artifacts_path)
+    masks_visible = load_visible_masks(masks_path)
+    all_poses, all_scores = prepare_iou_weighted_candidates(
+        artifacts,
+        masks_visible,
+    )
     mesh = trimesh.load(object_paths.mesh, force="mesh")
     trajectory = optimize_pose_candidates(all_poses, all_scores, mesh, config)
 
-    # Save the numeric trajectory for downstream use and the rendered video for
-    # human quality control.
     np.save(save_path, trajectory)
     render_optimized_poses(seq_dir, object_paths, mesh, trajectory)
     return "processed"

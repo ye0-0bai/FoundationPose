@@ -90,6 +90,18 @@ def _is_overwrite_guarded_save_exists_test(node):
     )
 
 
+def _imported_names(tree):
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+    return names
+
+
 def _if_by_test(node, predicate):
     for child in ast.walk(node):
         if isinstance(child, ast.If) and predicate(child.test):
@@ -142,7 +154,8 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         self.assertNotIn("smooth_pose_trajectory", imported_names)
         _find_function(tree, "select_pose_trajectory")
         _find_function(tree, "smooth_pose_trajectory")
-        _find_function(tree, "clean_pose_candidates")
+        _find_function(tree, "prepare_iou_weighted_candidates")
+        _find_function(tree, "compute_mask_ious")
         _find_function(tree, "transition_cost_matrix")
 
     def test_keeps_single_file_config_and_object_path_helpers(self):
@@ -163,9 +176,29 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         self.assertIn("objects", constants)
         self.assertIn("gpt", constants)
         self.assertIn("object_*", constants)
-        self.assertIn("all_poses&scores.pkl", constants)
-        self.assertIn("poses_optimized.npy", constants)
-        self.assertIn("poses_optimized.mp4", constants)
+        self.assertIn("all_pose_candidates_artifacts.npz", constants)
+        self.assertIn("poses_optimized_iou.npy", constants)
+        self.assertIn("poses_optimized_iou.mp4", constants)
+        self.assertNotIn("all_poses&scores.pkl", constants)
+        self.assertNotIn("poses_optimized.npy", constants)
+        self.assertNotIn("poses_optimized.mp4", constants)
+
+    def test_uses_kornia_warp_perspective_for_mask_crop_iou(self):
+        tree = _parse("optimize_precomputed_poses.py")
+        calls = _calls_under(tree)
+
+        self.assertIn("kornia.geometry.transform.warp_perspective", calls)
+
+    def test_legacy_pickle_loader_and_comments_are_removed(self):
+        source = (ROOT / "optimize_precomputed_poses.py").read_text()
+        tree = ast.parse(source)
+
+        self.assertNotIn("load_pose_candidates", {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)})
+        self.assertNotIn("CANDIDATES_FILENAME", {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)})
+        self.assertNotIn("pickle", _imported_names(tree))
+        self.assertNotIn("log-probability", source)
+        self.assertNotIn("log-softmax", source)
+        self.assertNotIn("all_poses&scores.pkl", source)
 
     def test_default_skip_guard_respects_overwrite(self):
         tree = _parse("optimize_precomputed_poses.py")

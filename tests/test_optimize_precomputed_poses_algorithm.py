@@ -4,7 +4,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from optimize_precomputed_poses import (
+    compute_mask_ious,
     normalize_scores,
+    prepare_iou_weighted_candidates,
     select_pose_trajectory,
     smooth_pose_trajectory,
 )
@@ -18,17 +20,87 @@ def _pose(x=0.0, angle=0.0):
 
 
 class OptimizePrecomputedPosesAlgorithmTests(unittest.TestCase):
-    def test_normalize_scores_preserves_existing_finite_and_nonfinite_behavior(self):
+    def test_normalize_scores_uses_minmax_scaling(self):
+        scores = np.array([2.0, 4.0, 6.0])
+
+        normalized = normalize_scores(scores, method="minmax")
+
+        self.assertTrue(np.allclose(normalized, [0.0, 0.5, 1.0]))
+
+    def test_normalize_scores_equal_finite_scores_become_ones(self):
+        scores = np.array([3.0, 3.0, 3.0])
+
+        normalized = normalize_scores(scores, method="minmax")
+
+        self.assertTrue(np.allclose(normalized, [1.0, 1.0, 1.0]))
+
+    def test_normalize_scores_ignores_nonfinite_values_for_minmax(self):
         scores = np.array([2.0, -np.inf, 1.0, np.nan])
 
-        normalized = normalize_scores(scores)
+        normalized = normalize_scores(scores, method="minmax")
 
-        expected_finite = np.array([2.0, 1.0])
-        expected_finite = expected_finite - expected_finite.max()
-        expected_finite = expected_finite - np.log(np.exp(expected_finite).sum())
-        self.assertTrue(np.allclose(normalized[[0, 2]], expected_finite))
-        self.assertEqual(normalized[1], -1e6)
-        self.assertEqual(normalized[3], -1e6)
+        self.assertTrue(np.allclose(normalized[[0, 2]], [1.0, 0.0]))
+        self.assertFalse(np.isfinite(normalized[1]))
+        self.assertFalse(np.isfinite(normalized[3]))
+
+    def test_compute_mask_ious_handles_perfect_partial_empty_and_disjoint_masks(self):
+        visible_mask = np.array(
+            [
+                [1, 0],
+                [0, 0],
+            ],
+            dtype=np.uint8,
+        )
+        identity_crop = np.eye(3, dtype=np.float32)
+        render_masks = np.array(
+            [
+                [[1, 0], [0, 0]],
+                [[1, 1], [0, 0]],
+                [[0, 0], [0, 0]],
+                [[0, 0], [0, 1]],
+            ],
+            dtype=np.uint8,
+        )
+        tf_to_crops = np.repeat(identity_crop[None], len(render_masks), axis=0)
+
+        ious = compute_mask_ious(visible_mask, render_masks, tf_to_crops)
+
+        self.assertTrue(np.allclose(ious, [1.0, 0.5, 0.0, 0.0]))
+
+    def test_prepare_iou_weighted_candidates_multiplies_minmax_scores_by_iou(self):
+        valid = np.array([True])
+        poses = [_pose(0.0), _pose(1.0), _pose(2.0)]
+        artifact_data = {
+            "valid": valid,
+            "poses_0000": np.stack(poses),
+            "scores_0000": np.array([2.0, 4.0, 6.0]),
+            "render_masks_0000": np.array(
+                [
+                    [[1, 0], [0, 0]],
+                    [[1, 1], [0, 0]],
+                    [[0, 0], [0, 1]],
+                ],
+                dtype=np.uint8,
+            ),
+            "tf_to_crops_0000": np.repeat(np.eye(3, dtype=np.float32)[None], 3, axis=0),
+        }
+        masks_visible = np.array(
+            [
+                [
+                    [1, 0],
+                    [0, 0],
+                ]
+            ],
+            dtype=np.uint8,
+        )
+
+        all_poses, adjusted_scores = prepare_iou_weighted_candidates(
+            artifact_data,
+            masks_visible,
+        )
+
+        self.assertEqual(len(all_poses), 1)
+        self.assertTrue(np.allclose(adjusted_scores[0], [0.0, 0.25, 0.0]))
 
     def test_select_pose_trajectory_prefers_smooth_global_path(self):
         all_poses = [
