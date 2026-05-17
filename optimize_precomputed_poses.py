@@ -13,12 +13,16 @@ invalid gaps may be interpolated and contiguous valid runs are smoothed with
 Savitzky-Golay filtering. Missing artifact or visible-mask files are reported
 and skipped without using any alternate input source.
 
-Outputs are written separately as ``poses_optimized_iou.npy`` and
-``poses_optimized_iou.mp4`` so older optimization products are left untouched.
+Outputs are written per run as ``poses_optimized_{uid}.npy`` and
+``poses_optimized_{uid}.mp4``. Optional trajectory-selection debug data is
+written as ``poses_optimized_{uid}_debug.npz``.
 """
 
 import argparse
+import datetime as dt
 import io
+import json
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,8 +43,11 @@ from process_data import configure_quiet_logging
 DEFAULT_DATA_ROOT = "/data/datasets/DexYCB/processed"
 ARTIFACTS_FILENAME = "all_pose_candidates_artifacts.npz"
 MASKS_FILENAME = "masks.npz"
-POSES_FILENAME = "poses_optimized_iou.npy"
-VIDEO_FILENAME = "poses_optimized_iou.mp4"
+POSES_FILENAME_TEMPLATE = "poses_optimized_{run_id}.npy"
+VIDEO_FILENAME_TEMPLATE = "poses_optimized_{run_id}.mp4"
+DEBUG_FILENAME_TEMPLATE = "poses_optimized_{run_id}_debug.npz"
+EXP_DIRNAME = "exp"
+POSE_OPTIMIZATION_RUNS_DIRNAME = "pose_optimization_runs"
 
 
 # ---------------------------------------------------------------------------
@@ -68,17 +75,19 @@ class ObjectPaths:
     masks: Path
     optimized_poses: Path
     optimized_video: Path
+    debug_data: Path
 
     @classmethod
-    def from_object_dir(cls, object_dir):
+    def from_object_dir(cls, object_dir, run_id):
         object_dir = Path(object_dir)
         return cls(
             object_dir=object_dir,
             mesh=object_dir / "mesh.glb",
             artifacts=object_dir / ARTIFACTS_FILENAME,
             masks=object_dir / MASKS_FILENAME,
-            optimized_poses=object_dir / POSES_FILENAME,
-            optimized_video=object_dir / VIDEO_FILENAME,
+            optimized_poses=object_dir / POSES_FILENAME_TEMPLATE.format(run_id=run_id),
+            optimized_video=object_dir / VIDEO_FILENAME_TEMPLATE.format(run_id=run_id),
+            debug_data=object_dir / DEBUG_FILENAME_TEMPLATE.format(run_id=run_id),
         )
 
 
@@ -104,7 +113,17 @@ def parse_args():
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Regenerate optimized outputs even when poses_optimized_iou.npy already exists.",
+        help="Regenerate optimized outputs even when the current run-id output already exists.",
+    )
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Run UID used in optimized output filenames. Defaults to script start timestamp.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write per-object trajectory-selection debug data for the current run.",
     )
     # The smoothing options are forwarded to smooth_pose_trajectory(), which
     # fills short invalid gaps before applying Savitzky-Golay filtering.
@@ -159,6 +178,75 @@ def ensure_optimization_config(config_or_args):
     if isinstance(config_or_args, OptimizationConfig):
         return config_or_args
     return optimization_config_from_args(config_or_args)
+
+
+def generate_run_id(now=None):
+    """Generate the default per-process run UID."""
+    if now is None:
+        now = dt.datetime.now()
+    return now.strftime("%Y%m%d-%H%M%S")
+
+
+def experiment_record_path(repo_root, run_id):
+    """Return the Markdown experiment record path for ``run_id``."""
+    return (
+        Path(repo_root)
+        / EXP_DIRNAME
+        / POSE_OPTIMIZATION_RUNS_DIRNAME
+        / f"{run_id}.md"
+    )
+
+
+def output_naming_for_run(run_id):
+    """Return output filename templates rendered for ``run_id``."""
+    return {
+        "poses": POSES_FILENAME_TEMPLATE.format(run_id=run_id),
+        "video": VIDEO_FILENAME_TEMPLATE.format(run_id=run_id),
+        "debug": DEBUG_FILENAME_TEMPLATE.format(run_id=run_id),
+    }
+
+
+def write_experiment_record(repo_root, run_id, generated_at, argv, args, stats):
+    """Write a Markdown experiment record with an embedded JSON config block."""
+    record_path = experiment_record_path(repo_root, run_id)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "generated_at": generated_at,
+        "argv": list(argv),
+        "data_root": str(args.data_root),
+        "output_naming": output_naming_for_run(run_id),
+        "optimization_objective": "score - trans_lambda * trans_cost - rot_lambda * rot_cost",
+        "optimization_parameters": {
+            "max_invalid_gap": args.max_invalid_gap,
+            "smooth_window": args.smooth_window,
+            "smooth_polyorder": args.smooth_polyorder,
+            "trans_lambda": args.trans_lambda,
+            "rot_lambda": args.rot_lambda,
+        },
+        "debug_enabled": bool(args.debug),
+        "debug_file_rule": (
+            DEBUG_FILENAME_TEMPLATE.format(run_id=run_id)
+            if args.debug
+            else "not written unless --debug is enabled"
+        ),
+        "processing_stats": dict(stats),
+    }
+    record_path.write_text(
+        "\n".join(
+            [
+                f"# Pose Optimization Run {run_id}",
+                "",
+                "```json",
+                json.dumps(payload, indent=2, sort_keys=True),
+                "```",
+                "",
+                "Objective: score - trans_lambda * trans_cost - rot_lambda * rot_cost",
+                "",
+            ]
+        )
+    )
+    return record_path
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +609,7 @@ def select_pose_trajectory(
     mesh_diameter,
     trans_lambda=1.0,
     rot_lambda=1.0,
+    return_debug=False,
 ):
     """Select one globally consistent pose candidate per valid frame.
 
@@ -534,9 +623,14 @@ def select_pose_trajectory(
         trans_lambda (float): Weight for translation transition cost.
         rot_lambda (float): Weight for rotation transition cost.
 
+        return_debug (bool): When true, also return arrays describing the
+            selected path's scores and transition penalties.
+
     Returns:
-        np.ndarray: A ``(T, 4, 4)`` pose trajectory. Frames with no valid
-        candidates remain all zeros.
+        np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]: A ``(T, 4, 4)``
+        pose trajectory. Frames with no valid candidates remain all zeros. With
+        ``return_debug=True``, the second element contains per-selected-frame
+        debug arrays.
 
     Raises:
         ValueError: If inputs are misaligned or no valid candidates exist.
@@ -544,7 +638,10 @@ def select_pose_trajectory(
     if len(all_poses) != len(all_scores):
         raise ValueError("all_poses and all_scores must have the same number of frames")
     if len(all_poses) == 0:
-        return np.empty((0, 4, 4), dtype=np.float64)
+        trajectory = np.empty((0, 4, 4), dtype=np.float64)
+        if return_debug:
+            return trajectory, empty_selection_debug()
+        return trajectory
 
     poses_per_frame, scores_per_frame, valid_frame_indices = filter_pose_candidates(
         all_poses,
@@ -589,7 +686,100 @@ def select_pose_trajectory(
         for frame_idx, candidate_idx in enumerate(selected_indices)
     ]
     selected_poses = np.stack(selected_poses, axis=0)
-    return build_trajectory(len(all_poses), valid_frame_indices, selected_poses)
+    trajectory = build_trajectory(len(all_poses), valid_frame_indices, selected_poses)
+    if return_debug:
+        debug = build_selection_debug(
+            poses_per_frame,
+            scores_per_frame,
+            valid_frame_indices,
+            selected_indices,
+            mesh_diameter=mesh_diameter,
+            trans_lambda=trans_lambda,
+            rot_lambda=rot_lambda,
+        )
+        return trajectory, debug
+    return trajectory
+
+
+def empty_selection_debug():
+    """Return an empty debug payload with stable array names and dtypes."""
+    return {
+        "frame_index": np.empty((0,), dtype=np.int64),
+        "selected_candidate_index": np.empty((0,), dtype=np.int64),
+        "selected_adjusted_score": np.empty((0,), dtype=np.float64),
+        "score_rank": np.empty((0,), dtype=np.int64),
+        "translation_cost": np.empty((0,), dtype=np.float64),
+        "rotation_cost": np.empty((0,), dtype=np.float64),
+        "weighted_translation_penalty": np.empty((0,), dtype=np.float64),
+        "weighted_rotation_penalty": np.empty((0,), dtype=np.float64),
+        "net_contribution": np.empty((0,), dtype=np.float64),
+        "cumulative_score": np.empty((0,), dtype=np.float64),
+    }
+
+
+def selected_score_ranks(scores, selected_indices):
+    """Compute one-based descending score ranks for selected candidates."""
+    ranks = []
+    for frame_scores, selected_idx in zip(scores, selected_indices):
+        finite_scores = frame_scores[np.isfinite(frame_scores)]
+        selected_score = frame_scores[selected_idx]
+        rank = 1 + int(np.sum(finite_scores > selected_score))
+        ranks.append(rank)
+    return np.asarray(ranks, dtype=np.int64)
+
+
+def build_selection_debug(
+    poses_per_frame,
+    scores_per_frame,
+    valid_frame_indices,
+    selected_indices,
+    mesh_diameter,
+    trans_lambda,
+    rot_lambda,
+):
+    """Build debug arrays for the final selected dynamic-programming path."""
+    debug = empty_selection_debug()
+    if len(selected_indices) == 0:
+        return debug
+
+    selected_scores = np.asarray(
+        [
+            scores_per_frame[frame_idx][candidate_idx]
+            for frame_idx, candidate_idx in enumerate(selected_indices)
+        ],
+        dtype=np.float64,
+    )
+    trans_costs = np.zeros(len(selected_indices), dtype=np.float64)
+    rot_costs = np.zeros(len(selected_indices), dtype=np.float64)
+    for frame_idx in range(1, len(selected_indices)):
+        prev_candidate_idx = selected_indices[frame_idx - 1]
+        cur_candidate_idx = selected_indices[frame_idx]
+        trans_cost, rot_cost = transition_cost_matrix(
+            poses_per_frame[frame_idx - 1][prev_candidate_idx : prev_candidate_idx + 1],
+            poses_per_frame[frame_idx][cur_candidate_idx : cur_candidate_idx + 1],
+            mesh_diameter,
+        )
+        trans_costs[frame_idx] = trans_cost[0, 0]
+        rot_costs[frame_idx] = rot_cost[0, 0]
+
+    weighted_trans = float(trans_lambda) * trans_costs
+    weighted_rot = float(rot_lambda) * rot_costs
+    net = selected_scores - weighted_trans - weighted_rot
+    debug.update(
+        {
+            "frame_index": np.asarray(valid_frame_indices, dtype=np.int64),
+            "selected_candidate_index": np.asarray(selected_indices, dtype=np.int64),
+            "selected_adjusted_score": selected_scores,
+            "score_rank": selected_score_ranks(scores_per_frame, selected_indices),
+            "translation_cost": trans_costs,
+            "rotation_cost": rot_costs,
+            "weighted_translation_penalty": weighted_trans,
+            "weighted_rotation_penalty": weighted_rot,
+            "net_contribution": net,
+            "cumulative_score": np.cumsum(net),
+        }
+    )
+    return debug
 
 
 def smooth_pose_trajectory(
@@ -645,7 +835,7 @@ def smooth_pose_trajectory(
     return smoothed
 
 
-def optimize_pose_candidates(all_poses, all_scores, mesh, config):
+def optimize_pose_candidates(all_poses, all_scores, mesh, config, return_debug=False):
     """Select and smooth the best IoU-weighted pose trajectory for one object.
 
     Args:
@@ -669,19 +859,27 @@ def optimize_pose_candidates(all_poses, all_scores, mesh, config):
         model_pts=np.asarray(mesh.vertices),
         n_sample=10000,
     )
-    trajectory = select_pose_trajectory(
+    selected = select_pose_trajectory(
         all_poses,
         all_scores,
         mesh_diameter=mesh_diameter,
         trans_lambda=config.trans_lambda,
         rot_lambda=config.rot_lambda,
+        return_debug=return_debug,
     )
-    return smooth_pose_trajectory(
+    if return_debug:
+        trajectory, debug = selected
+    else:
+        trajectory = selected
+    smoothed = smooth_pose_trajectory(
         trajectory,
         max_invalid_gap=config.max_invalid_gap,
         smooth_window=config.smooth_window,
         smooth_polyorder=config.smooth_polyorder,
     )
+    if return_debug:
+        return smoothed, debug
+    return smoothed
 
 
 # ---------------------------------------------------------------------------
@@ -698,9 +896,6 @@ def render_optimized_poses(seq_dir, object_paths, mesh, trajectory):
         trajectory (np.ndarray): Optimized pose trajectory with shape
             ``(T, 4, 4)``. All-zero poses are treated as invalid frames.
     """
-    if not isinstance(object_paths, ObjectPaths):
-        object_paths = ObjectPaths.from_object_dir(object_paths)
-
     # The optimized overlay uses the original sequence video and camera
     # intrinsics so the output can be inspected directly against RGB frames.
     intrinsics_path = seq_dir / "video" / "intrinsics.npy"
@@ -770,7 +965,7 @@ def process_object(seq_dir, object_dir, args):
         ``skipped_missing_artifacts``, ``skipped_missing_masks``, or
         ``processed``.
     """
-    object_paths = ObjectPaths.from_object_dir(object_dir)
+    object_paths = ObjectPaths.from_object_dir(object_dir, run_id=args.run_id)
 
     save_path = object_paths.optimized_poses
     if not args.overwrite and save_path.exists():
@@ -794,9 +989,21 @@ def process_object(seq_dir, object_dir, args):
         masks_visible,
     )
     mesh = trimesh.load(object_paths.mesh, force="mesh")
-    trajectory = optimize_pose_candidates(all_poses, all_scores, mesh, config)
+    optimized = optimize_pose_candidates(
+        all_poses,
+        all_scores,
+        mesh,
+        config,
+        return_debug=args.debug,
+    )
+    if args.debug:
+        trajectory, debug = optimized
+    else:
+        trajectory = optimized
 
     np.save(save_path, trajectory)
+    if args.debug:
+        np.savez(object_paths.debug_data, **debug)
     render_optimized_poses(seq_dir, object_paths, mesh, trajectory)
     return "processed"
 
@@ -804,6 +1011,9 @@ def process_object(seq_dir, object_dir, args):
 def main():
     """Run pose optimization for every processed DexYCB object directory."""
     args = parse_args()
+    run_id = args.run_id or generate_run_id()
+    args.run_id = run_id
+    generated_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     # Suppress noisy third-party logs so progress and failure messages remain
     # readable during long dataset-wide batch runs.
     configure_quiet_logging()
@@ -813,6 +1023,13 @@ def main():
     data_root = Path(args.data_root)
     seq_dirs = sorted(data_root.glob("**/video"))
     seq_dirs = [seq_dir.parent for seq_dir in seq_dirs]
+    stats = {
+        "processed": 0,
+        "skipped_existing": 0,
+        "skipped_missing_artifacts": 0,
+        "skipped_missing_masks": 0,
+        "failed": 0,
+    }
 
     for seq_dir in tqdm.tqdm(seq_dirs, dynamic_ncols=True):
         try:
@@ -820,15 +1037,26 @@ def main():
             objects_root = seq_dir / "objects" / "gpt"
             object_dirs = sorted(objects_root.glob("object_*"))
             for object_dir in object_dirs:
-                process_object(seq_dir, object_dir, args)
+                status = process_object(seq_dir, object_dir, args)
+                stats[status] = stats.get(status, 0) + 1
 
         except Exception:
             # Keep batch processing alive after a sequence-level failure while
             # preserving the full traceback for later debugging.
+            stats["failed"] = stats.get("failed", 0) + 1
             tqdm.tqdm.write(f"Failed to process {seq_dir.relative_to(data_root)}")
             io_string = io.StringIO()
             traceback.print_exc(file=io_string)
             tqdm.tqdm.write(io_string.getvalue())
+
+    write_experiment_record(
+        Path(__file__).resolve().parent,
+        run_id=run_id,
+        generated_at=generated_at,
+        argv=sys.argv,
+        args=args,
+        stats=stats,
+    )
 
 
 if __name__ == "__main__":

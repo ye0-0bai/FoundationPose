@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 import unittest
 
@@ -123,7 +124,16 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
                 "--smooth-polyorder",
                 "--trans-lambda",
                 "--rot-lambda",
+                "--run-id",
+                "--debug",
             }.issubset(_parser_add_argument_flags(parse_args))
+        )
+
+        self.assertTrue(
+            all(
+                "dp" not in flag.lower()
+                for flag in _parser_add_argument_flags(parse_args)
+            )
         )
 
     def test_uses_precomputed_candidates_without_foundationpose(self):
@@ -177,11 +187,34 @@ class OptimizePrecomputedPosesStaticTests(unittest.TestCase):
         self.assertIn("gpt", constants)
         self.assertIn("object_*", constants)
         self.assertIn("all_pose_candidates_artifacts.npz", constants)
-        self.assertIn("poses_optimized_iou.npy", constants)
-        self.assertIn("poses_optimized_iou.mp4", constants)
+        self.assertIn("poses_optimized_{run_id}.npy", constants)
+        self.assertIn("poses_optimized_{run_id}.mp4", constants)
+        self.assertIn("poses_optimized_{run_id}_debug.npz", constants)
+        self.assertIn("exp", constants)
+        self.assertIn("pose_optimization_runs", constants)
+        self.assertNotIn("poses_optimized_iou.npy", constants)
+        self.assertNotIn("poses_optimized_iou.mp4", constants)
         self.assertNotIn("all_poses&scores.pkl", constants)
         self.assertNotIn("poses_optimized.npy", constants)
         self.assertNotIn("poses_optimized.mp4", constants)
+
+    def test_run_id_default_uses_single_timestamp_format(self):
+        source = (ROOT / "optimize_precomputed_poses.py").read_text()
+
+        self.assertIn("%Y%m%d-%H%M%S", source)
+        self.assertRegex(source, r"run_id\s*=\s*args\.run_id\s+or\s+generate_run_id\(\)")
+
+    def test_static_experiment_record_helpers_exist(self):
+        tree = _parse("optimize_precomputed_poses.py")
+
+        _find_function(tree, "experiment_record_path")
+        _find_function(tree, "write_experiment_record")
+        _find_function(tree, "generate_run_id")
+
+    def test_gitignore_allows_exp_tracking(self):
+        gitignore = (ROOT / ".gitignore").read_text()
+
+        self.assertIsNone(re.search(r"(?m)^exp/$", gitignore))
 
     def test_uses_kornia_warp_perspective_for_mask_crop_iou(self):
         tree = _parse("optimize_precomputed_poses.py")
