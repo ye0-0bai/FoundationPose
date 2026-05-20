@@ -14,6 +14,8 @@ import imageio.v3 as iio
 import numpy as np
 from tqdm import tqdm
 
+from tracking_registration import invalid_pose, is_invalid_pose, registration_inputs_are_valid
+
 
 DEFAULT_DATA_ROOT = "/data/datasets/DexYCB_1080P_15fps_30s"
 
@@ -222,6 +224,10 @@ def render_pose_video(images, poses, intrinsics, mesh, worker_state):
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
     frames = []
     for frame_idx, pose in enumerate(poses):
+        if is_invalid_pose(pose):
+            frames.append(images[frame_idx])
+            continue
+
         center_pose = pose @ np.linalg.inv(to_origin)
         vis = worker_state["draw_posed_3d_box"](
             intrinsics,
@@ -253,9 +259,14 @@ def process_object(object_dir, intrinsics, images, depths, worker_state):
     est = setup_estimator_for_mesh(mesh, worker_state)
 
     poses = []
+    tracking_initialized = False
     frame_count = images.shape[0]
     for frame_idx in range(frame_count):
-        if frame_idx == 0:
+        if not tracking_initialized:
+            if not registration_inputs_are_valid(masks[frame_idx], depths[frame_idx]):
+                poses.append(invalid_pose())
+                continue
+
             pose = est.register(
                 K=intrinsics,
                 rgb=images[frame_idx],
@@ -263,6 +274,10 @@ def process_object(object_dir, intrinsics, images, depths, worker_state):
                 ob_mask=masks[frame_idx],
                 iteration=5,
             )
+            if pose is None or getattr(est, "pose_last", None) is None:
+                poses.append(invalid_pose())
+                continue
+            tracking_initialized = True
         else:
             pose = est.track_one(
                 K=intrinsics,

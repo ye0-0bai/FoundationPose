@@ -22,6 +22,7 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from estimater import *
 from datareader import *
+from tracking_registration import invalid_pose, is_invalid_pose, registration_inputs_are_valid
 
 
 DEFAULT_SCFLOW2_CONFIG = "third_party/SCFlow2/configs/flow_refine/scflow2.py"
@@ -248,10 +249,16 @@ def main():
                             )
 
                     poses = []
+                    tracking_initialized = False
                     T = images.shape[0]
                     for frame_idx in range(T):
-                        if frame_idx == 0:
-                            # Initialize the pose from the first visible object mask.
+                        if not tracking_initialized:
+                            # Keep trying to initialize until a frame has enough
+                            # masked valid-depth pixels for FoundationPose.
+                            if not registration_inputs_are_valid(masks[frame_idx], depths[frame_idx]):
+                                poses.append(invalid_pose())
+                                continue
+
                             stage_start = time.perf_counter()
                             pose = est.register(
                                 K=intrinsics,
@@ -261,6 +268,10 @@ def main():
                                 iteration=5,
                             )
                             add_timing(object_timing_stats, "register", time.perf_counter() - stage_start)
+                            if pose is None or getattr(est, "pose_last", None) is None:
+                                poses.append(invalid_pose())
+                                continue
+                            tracking_initialized = True
                         else:
                             # Track from the previous frame's pose estimate.
                             stage_start = time.perf_counter()
@@ -272,7 +283,7 @@ def main():
                             )
                             add_timing(object_timing_stats, "track_one", time.perf_counter() - stage_start)
 
-                        if scflow2_refiner is not None:
+                        if scflow2_refiner is not None and not is_invalid_pose(pose):
                             # Refine the current FoundationPose estimate with the
                             # same frame inputs before using it as tracking state.
                             stage_start = time.perf_counter()
@@ -322,6 +333,15 @@ def main():
                         # Visualization helpers draw boxes around a centered mesh,
                         # so convert from the original mesh pose first.
                         stage_start = time.perf_counter()
+                        if is_invalid_pose(pose):
+                            video.append(images[frame_idx])
+                            add_timing(
+                                object_timing_stats,
+                                "visualization_rendering",
+                                time.perf_counter() - stage_start,
+                            )
+                            continue
+
                         center_pose = pose@np.linalg.inv(to_origin)
                         vis = draw_posed_3d_box(intrinsics, img=images[frame_idx], ob_in_cam=center_pose, bbox=bbox)
                         vis = draw_xyz_axis(images[frame_idx], ob_in_cam=center_pose, scale=0.1, K=intrinsics, thickness=3, transparency=0, is_input_rgb=True)
